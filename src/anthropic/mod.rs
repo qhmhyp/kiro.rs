@@ -22,6 +22,8 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
+#[cfg(test)]
+mod cache_scenarios;
 mod converter;
 mod handlers;
 mod middleware;
