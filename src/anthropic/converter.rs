@@ -123,6 +123,9 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 用于 usage 缓存查找的会话标识
+    /// 来自 metadata.user_id 中提取的 session UUID，缺省时为新生成的 UUID
+    pub conversation_id: String,
 }
 
 /// 转换错误
@@ -312,7 +315,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
-    let conversation_state = ConversationState::new(conversation_id)
+    let conversation_state = ConversationState::new(conversation_id.clone())
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
@@ -329,6 +332,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        conversation_id,
     })
 }
 

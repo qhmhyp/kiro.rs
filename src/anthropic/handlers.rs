@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
+use super::prefix_cache::ConvoTokenCache;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
@@ -264,6 +265,15 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 抓住 usage 缓存所需的标识与当前轮 token（必须在 payload 字段被 move 之前算出来）
+    let conversation_id = conversion_result.conversation_id;
+    let current_turn_tokens = payload
+        .messages
+        .last()
+        .map(|m| token::count_message_tokens(&m.content) as i32)
+        .unwrap_or(0);
+    let convo_cache = state.convo_cache.clone();
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -290,12 +300,25 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            convo_cache,
+            conversation_id,
+            current_turn_tokens,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            convo_cache,
+            conversation_id,
+            current_turn_tokens,
+        ).await
     }
 }
 
@@ -307,6 +330,9 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    convo_cache: std::sync::Arc<ConvoTokenCache>,
+    conversation_id: String,
+    current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -315,7 +341,8 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
+        .with_usage_cache(convo_cache, conversation_id, current_turn_tokens);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -443,6 +470,9 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    convo_cache: std::sync::Arc<ConvoTokenCache>,
+    conversation_id: String,
+    current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -602,6 +632,11 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // 模拟 prompt cache：把 final_input_tokens 拆成三段
+    let (cache_read, cache_creation, input_tokens_split) =
+        convo_cache.peek(&conversation_id, final_input_tokens, current_turn_tokens);
+    convo_cache.commit(&conversation_id, final_input_tokens, current_turn_tokens);
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -612,7 +647,9 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
+            "input_tokens": input_tokens_split,
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read,
             "output_tokens": output_tokens
         }
     });
@@ -777,6 +814,15 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 抓住 usage 缓存所需的标识与当前轮 token（必须在 payload 字段被 move 之前算出来）
+    let conversation_id = conversion_result.conversation_id;
+    let current_turn_tokens = payload
+        .messages
+        .last()
+        .map(|m| token::count_message_tokens(&m.content) as i32)
+        .unwrap_or(0);
+    let convo_cache = state.convo_cache.clone();
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -803,12 +849,25 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            convo_cache,
+            conversation_id,
+            current_turn_tokens,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            convo_cache,
+            conversation_id,
+            current_turn_tokens,
+        ).await
     }
 }
 
@@ -823,6 +882,9 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    convo_cache: std::sync::Arc<ConvoTokenCache>,
+    conversation_id: String,
+    current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -831,7 +893,8 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map)
+        .with_usage_cache(convo_cache, conversation_id, current_turn_tokens);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

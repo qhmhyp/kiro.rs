@@ -13,6 +13,7 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::prefix_cache::ConvoTokenCache;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -25,6 +26,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 会话级 usage 缓存（仅用于在 usage 字段里模拟 prompt cache 命中，不影响真实上游调用）
+    pub convo_cache: Arc<ConvoTokenCache>,
 }
 
 impl AppState {
@@ -34,6 +37,7 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            convo_cache: Arc::new(ConvoTokenCache::new()),
         }
     }
 
