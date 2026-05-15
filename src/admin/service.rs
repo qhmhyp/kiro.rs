@@ -14,7 +14,7 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -102,19 +102,12 @@ impl AdminService {
     }
 
     /// 设置凭据禁用状态
+    ///
+    /// 禁用后无需手动切换：下一次 `acquire_credential` 自动按优先级分组 + 组内 LRU 选择
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
-        // 先获取当前凭据 ID，用于判断是否需要切换
-        let snapshot = self.token_manager.snapshot();
-        let current_id = snapshot.current_id;
-
         self.token_manager
             .set_disabled(id, disabled)
             .map_err(|e| self.classify_error(e, id))?;
-
-        // 只有禁用的是当前凭据时才尝试切换到下一个
-        if disabled && id == current_id {
-            let _ = self.token_manager.switch_to_next();
-        }
         Ok(())
     }
 
@@ -271,32 +264,6 @@ impl AdminService {
         self.save_balance_cache();
 
         Ok(())
-    }
-
-    /// 获取负载均衡模式
-    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
-        LoadBalancingModeResponse {
-            mode: self.token_manager.get_load_balancing_mode(),
-        }
-    }
-
-    /// 设置负载均衡模式
-    pub fn set_load_balancing_mode(
-        &self,
-        req: SetLoadBalancingModeRequest,
-    ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
-            return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
-            ));
-        }
-
-        self.token_manager
-            .set_load_balancing_mode(req.mode.clone())
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
     /// 强制刷新指定凭据的 Token

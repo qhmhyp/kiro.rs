@@ -8,8 +8,6 @@ import {
   getCredentialBalance,
   addCredential,
   deleteCredential,
-  getLoadBalancingMode,
-  setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -100,21 +98,3 @@ export function useDeleteCredential() {
   })
 }
 
-// 获取负载均衡模式
-export function useLoadBalancingMode() {
-  return useQuery({
-    queryKey: ['loadBalancingMode'],
-    queryFn: getLoadBalancingMode,
-  })
-}
-
-// 设置负载均衡模式
-export function useSetLoadBalancingMode() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: setLoadBalancingMode,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
-    },
-  })
-}

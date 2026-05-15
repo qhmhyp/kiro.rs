@@ -178,24 +178,6 @@ pub struct BalanceResponse {
     pub next_reset_at: Option<f64>,
 }
 
-// ============ 负载均衡配置 ============
-
-/// 负载均衡模式响应
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
-    pub mode: String,
-}
-
-/// 设置负载均衡模式请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
-    pub mode: String,
-}
-
 // ============ 通用响应 ============
 
 /// 操作成功响应
