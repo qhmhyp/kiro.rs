@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::provider::{KiroProvider, VerifyOutcome};
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
@@ -34,6 +35,7 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    kiro_provider: Arc<KiroProvider>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -43,6 +45,7 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
+        kiro_provider: Arc<KiroProvider>,
         known_endpoints: impl IntoIterator<Item = String>,
     ) -> Self {
         let cache_path = token_manager
@@ -53,6 +56,7 @@ impl AdminService {
 
         Self {
             token_manager,
+            kiro_provider,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
@@ -420,5 +424,47 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+
+    /// 用指定凭据 + 指定模型发起一次最小 messages 请求，验证凭据有效性。
+    ///
+    /// 即使凭据处于 disabled / cooldown 状态也会绕过调度强制使用该凭据。
+    /// 返回结构化的 VerifyOutcome（status / latency_ms / error）。
+    pub async fn verify_credential_message(
+        &self,
+        id: u64,
+        model: &str,
+    ) -> Result<VerifyOutcome, AdminServiceError> {
+        use crate::anthropic::converter::convert_request;
+        use crate::anthropic::types::MessagesRequest;
+        use crate::kiro::model::requests::kiro::KiroRequest;
+
+        // 先校验 id 是否存在（避免后续构造请求失败时误判为"模型错误"）
+        if !self.token_manager.snapshot().entries.iter().any(|e| e.id == id) {
+            return Err(AdminServiceError::NotFound { id });
+        }
+
+        // 构造最小 messages 请求体（MessagesRequest 只 derive Deserialize，所以从 JSON 反序列化）
+        let request_json = serde_json::json!({
+            "model": model,
+            "max_tokens": 8,
+            "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let request: MessagesRequest = serde_json::from_value(request_json)
+            .map_err(|e| AdminServiceError::InternalError(format!("构造测试请求失败: {}", e)))?;
+
+        let conversion = convert_request(&request)
+            .map_err(|e| AdminServiceError::InvalidCredential(format!("模型不受支持或请求无效: {:?}", e)))?;
+
+        let kiro_request = KiroRequest {
+            conversation_state: conversion.conversation_state,
+            profile_arn: None,
+        };
+
+        let body = serde_json::to_string(&kiro_request)
+            .map_err(|e| AdminServiceError::InternalError(format!("序列化失败: {}", e)))?;
+
+        Ok(self.kiro_provider.send_once_with_credential(id, &body).await)
     }
 }

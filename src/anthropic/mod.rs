@@ -24,7 +24,7 @@
 
 #[cfg(test)]
 mod cache_scenarios;
-mod converter;
+pub(crate) mod converter;
 mod handlers;
 mod middleware;
 mod prefix_cache;

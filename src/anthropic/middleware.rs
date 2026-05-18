@@ -41,9 +41,9 @@ impl AppState {
         }
     }
 
-    /// 设置 KiroProvider
-    pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
-        self.kiro_provider = Some(Arc::new(provider));
+    /// 设置 KiroProvider（共享 Arc，与其他组件复用同一实例）
+    pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.kiro_provider = Some(provider);
         self
     }
 }

@@ -8,6 +8,7 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
+use std::sync::Arc;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -36,7 +37,7 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
-    kiro_provider: Option<KiroProvider>,
+    kiro_provider: Option<Arc<KiroProvider>>,
     extract_thinking: bool,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking);

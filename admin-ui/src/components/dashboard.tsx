@@ -6,7 +6,7 @@ import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { CredentialCard } from '@/components/credential-card'
+import { CredentialRow } from '@/components/credential-row'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
@@ -677,18 +677,35 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-                {currentCredentials.map((credential) => (
-                  <CredentialCard
-                    key={credential.id}
-                    credential={credential}
-                    onViewBalance={handleViewBalance}
-                    selected={selectedIds.has(credential.id)}
-                    onToggleSelect={() => toggleSelect(credential.id)}
-                    balance={balanceMap.get(credential.id) || null}
-                    loadingBalance={loadingBalanceIds.has(credential.id)}
-                  />
-                ))}
+              <div className="rounded-md border bg-card overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50 text-xs text-muted-foreground">
+                    <tr className="border-b">
+                      <th className="px-2 py-2 text-left font-medium w-8"></th>
+                      <th className="px-2 py-2 text-left font-medium">凭据</th>
+                      <th className="px-2 py-2 text-left font-medium">订阅</th>
+                      <th className="px-2 py-2 text-left font-medium">优先级</th>
+                      <th className="px-2 py-2 text-left font-medium">状态</th>
+                      <th className="px-2 py-2 text-left font-medium">计数 / 用量</th>
+                      <th className="px-2 py-2 text-left font-medium">最近使用</th>
+                      <th className="px-2 py-2 text-left font-medium">验证</th>
+                      <th className="px-2 py-2 text-left font-medium">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {currentCredentials.map((credential) => (
+                      <CredentialRow
+                        key={credential.id}
+                        credential={credential}
+                        onViewBalance={handleViewBalance}
+                        selected={selectedIds.has(credential.id)}
+                        onToggleSelect={() => toggleSelect(credential.id)}
+                        balance={balanceMap.get(credential.id) || null}
+                        loadingBalance={loadingBalanceIds.has(credential.id)}
+                      />
+                    ))}
+                  </tbody>
+                </table>
               </div>
 
               {/* 分页控件 */}

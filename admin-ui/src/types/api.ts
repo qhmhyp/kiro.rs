@@ -87,3 +87,11 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// 凭据消息验证响应（POST /credentials/:id/verify-message）
+export interface VerifyMessageResponse {
+  ok: boolean
+  status?: number | null
+  latencyMs: number
+  error?: string | null
+}

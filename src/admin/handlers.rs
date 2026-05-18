@@ -8,7 +8,10 @@ use axum::{
 
 use super::{
     middleware::AdminState,
-    types::{AddCredentialRequest, SetDisabledRequest, SetPriorityRequest, SuccessResponse},
+    types::{
+        AddCredentialRequest, SetDisabledRequest, SetPriorityRequest, SuccessResponse,
+        VerifyMessageRequest,
+    },
 };
 
 /// GET /api/admin/credentials
@@ -115,6 +118,23 @@ pub async fn force_refresh_token(
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/verify-message
+/// 用指定凭据 + 模型发起一次最小 messages 请求，返回 status / latency / 错误信息
+pub async fn verify_credential_message(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<VerifyMessageRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .verify_credential_message(id, &payload.model)
+        .await
+    {
+        Ok(outcome) => Json(outcome).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

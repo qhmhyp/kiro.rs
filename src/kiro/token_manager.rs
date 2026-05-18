@@ -826,6 +826,26 @@ impl MultiTokenManager {
         }
     }
 
+    /// 按指定 id 强制获取调用上下文，**不经过调度器**，不受 disabled / cooldown 状态影响。
+    ///
+    /// 用于"验证单个凭据有效性"等场景：调用方明确指定要测哪个凭据，期望即使凭据
+    /// 处于禁用或冷却状态也能拿到 token 发起一次真实请求。Token 仍会按需刷新。
+    ///
+    /// # Errors
+    /// - 凭据 id 不存在
+    /// - Token 刷新失败
+    pub async fn acquire_context_for_id(&self, id: u64) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
+        };
+        self.try_ensure_token(id, &credentials).await
+    }
+
     /// 尝试使用指定凭据获取有效 Token
     ///
     /// 使用双重检查锁定模式，确保同一时间只有一个刷新操作
@@ -2655,6 +2675,68 @@ mod tests {
         assert_eq!(manager.available_count(), 1);
         let (id, _) = manager.acquire_credential(None).expect("过期后应可用");
         assert_eq!(id, 1);
+    }
+
+    // ============ 按 id 强制取 context 测试 ============
+
+    /// acquire_context_for_id 即使在凭据被 disabled（TooManyFailures）时也能取到
+    #[tokio::test]
+    async fn test_acquire_context_for_id_works_on_disabled_credential() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert_eq!(manager.available_count(), 1, "cred1 应已禁用");
+
+        let ctx = manager.acquire_context_for_id(1).await.unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "t1");
+    }
+
+    /// acquire_context_for_id 在凭据处于限流冷却中时也能取到
+    #[tokio::test]
+    async fn test_acquire_context_for_id_works_on_cooled_down_credential() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
+
+        manager.report_rate_limited(1, StdDuration::from_secs(600));
+        assert_eq!(manager.available_count(), 0, "cred1 应冷却中");
+
+        let ctx = manager.acquire_context_for_id(1).await.unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "t1");
+    }
+
+    /// 不存在的 id 应明确报错
+    #[tokio::test]
+    async fn test_acquire_context_for_id_unknown_id_errors() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
+
+        let err = manager
+            .acquire_context_for_id(999)
+            .await
+            .err()
+            .expect("应返回错误")
+            .to_string();
+        assert!(err.contains("不存在"), "实际错误: {}", err);
     }
 
     /// 所有凭据都被冷却时，acquire_context 应明确报错

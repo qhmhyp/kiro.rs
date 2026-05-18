@@ -8,6 +8,7 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  VerifyMessageResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -90,6 +91,18 @@ export async function addCredential(
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+// 用一次最小 messages 请求验证凭据 + 模型是否可用
+export async function verifyCredentialMessage(
+  id: number,
+  model: string
+): Promise<VerifyMessageResponse> {
+  const { data } = await api.post<VerifyMessageResponse>(
+    `/credentials/${id}/verify-message`,
+    { model }
+  )
   return data
 }
 

@@ -74,6 +74,14 @@ pub struct SetDisabledRequest {
     pub disabled: bool,
 }
 
+/// 验证凭据请求（用一次最小 messages 调用测试凭据 + 模型有效性）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyMessageRequest {
+    /// 测试用模型 ID，如 "claude-haiku-4-5"
+    pub model: String,
+}
+
 /// 修改优先级请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

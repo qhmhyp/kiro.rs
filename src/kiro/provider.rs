@@ -6,9 +6,10 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -24,6 +25,30 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+
+/// 单凭据验证结果（[`KiroProvider::send_once_with_credential`] 的返回值）
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifyOutcome {
+    /// 上游返回 2xx 时为 true
+    pub ok: bool,
+    /// 上游 HTTP 状态码；网络层失败时为 None
+    pub status: Option<u16>,
+    /// 端到端耗时（毫秒）
+    pub latency_ms: u64,
+    /// 失败时填充错误信息或响应体摘要
+    pub error: Option<String>,
+}
+
+impl VerifyOutcome {
+    fn failure(status: Option<u16>, latency_ms: u64, error: String) -> Self {
+        Self {
+            ok: false,
+            status,
+            latency_ms,
+            error: Some(error),
+        }
+    }
+}
 
 /// Kiro API Provider
 ///
@@ -113,6 +138,104 @@ impl KiroProvider {
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         self.call_api_with_retry(request_body, false).await
+    }
+
+    /// 用指定凭据发送一次非流式 API 请求，**不重试、不切换凭据、不冷却**。
+    ///
+    /// 用于"验证单个凭据"场景：调用方明确指定凭据 id，期望即使该凭据被禁用或在
+    /// 冷却中也能拿到 token 发出一次真实请求并返回结构化结果。
+    pub async fn send_once_with_credential(
+        &self,
+        id: u64,
+        request_body: &str,
+    ) -> VerifyOutcome {
+        let start = Instant::now();
+
+        let ctx = match self.token_manager.acquire_context_for_id(id).await {
+            Ok(c) => c,
+            Err(e) => {
+                return VerifyOutcome::failure(
+                    None,
+                    start.elapsed().as_millis() as u64,
+                    format!("获取凭据上下文失败: {}", e),
+                );
+            }
+        };
+
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+
+        let endpoint = match self.endpoint_for(&ctx.credentials) {
+            Ok(e) => e,
+            Err(e) => {
+                return VerifyOutcome::failure(
+                    None,
+                    start.elapsed().as_millis() as u64,
+                    format!("endpoint 解析失败: {}", e),
+                );
+            }
+        };
+
+        let rctx = RequestContext {
+            credentials: &ctx.credentials,
+            token: &ctx.token,
+            machine_id: &machine_id,
+            config,
+        };
+
+        let url = endpoint.api_url(&rctx);
+        let body = endpoint.transform_api_body(request_body, &rctx);
+
+        let client = match self.client_for(&ctx.credentials) {
+            Ok(c) => c,
+            Err(e) => {
+                return VerifyOutcome::failure(
+                    None,
+                    start.elapsed().as_millis() as u64,
+                    format!("HTTP client 构建失败: {}", e),
+                );
+            }
+        };
+
+        let base = client
+            .post(&url)
+            .body(body)
+            .header("content-type", "application/json")
+            .header("Connection", "close");
+        let request = endpoint.decorate_api(base, &rctx);
+
+        match request.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let latency_ms = start.elapsed().as_millis() as u64;
+                if status.is_success() {
+                    VerifyOutcome {
+                        ok: true,
+                        status: Some(status.as_u16()),
+                        latency_ms,
+                        error: None,
+                    }
+                } else {
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let preview = if body_text.len() > 500 {
+                        format!("{}...", &body_text[..500])
+                    } else {
+                        body_text
+                    };
+                    VerifyOutcome {
+                        ok: false,
+                        status: Some(status.as_u16()),
+                        latency_ms,
+                        error: Some(preview),
+                    }
+                }
+            }
+            Err(e) => VerifyOutcome::failure(
+                None,
+                start.elapsed().as_millis() as u64,
+                format!("请求发送失败: {}", e),
+            ),
+        }
     }
 
     /// 发送流式 API 请求
