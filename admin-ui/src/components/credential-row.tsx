@@ -173,8 +173,11 @@ export function CredentialRow({
   const usage = loadingBalance ? (
     <Loader2 className="inline w-3 h-3 animate-spin" />
   ) : balance ? (
-    <span className="text-xs whitespace-nowrap">
-      {balance.remaining.toFixed(1)}/{balance.usageLimit.toFixed(0)}
+    <span
+      className="text-xs whitespace-nowrap"
+      title={`已用 ${balance.usagePercentage.toFixed(1)}%（可超额计费）`}
+    >
+      {balance.currentUsage.toFixed(1)}/{balance.usageLimit.toFixed(0)}
     </span>
   ) : (
     <span className="text-xs text-muted-foreground">-</span>
