@@ -414,6 +414,8 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 限流冷却到期时间。Some 且 > now 时该凭据暂时不可用；不持久化。
+    cooldown_until: Option<DateTime<Utc>>,
 }
 
 /// 禁用原因
@@ -597,6 +599,7 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    cooldown_until: None,
                 }
             })
             .collect();
@@ -679,9 +682,14 @@ impl MultiTokenManager {
         self.entries.lock().len()
     }
 
-    /// 获取可用凭据数量
+    /// 获取可用凭据数量（排除已禁用和冷却中的）
     pub fn available_count(&self) -> usize {
-        self.entries.lock().iter().filter(|e| !e.disabled).count()
+        let now = Utc::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled && e.cooldown_until.map_or(true, |t| now >= t))
+            .count()
     }
 
     /// 选择下一个凭据：优先级分组 + 组内 LRU
@@ -704,8 +712,11 @@ impl MultiTokenManager {
                 .map(|m| m.to_lowercase().contains("opus"))
                 .unwrap_or(false);
 
+            let now = Utc::now();
             let matches = |e: &CredentialEntry| -> bool {
-                !e.disabled && (!is_opus || e.credentials.supports_opus())
+                !e.disabled
+                    && e.cooldown_until.map_or(true, |t| now >= t)
+                    && (!is_opus || e.credentials.supports_opus())
             };
 
             // 1) 取所有可用凭据中最小的 priority
@@ -1181,6 +1192,39 @@ impl MultiTokenManager {
         has_available
     }
 
+    /// 报告指定凭据被上游限流（HTTP 429），将其加入临时冷却。
+    ///
+    /// 冷却期间该凭据不会被 `acquire_credential` 选中；冷却到期后由 `acquire_credential`
+    /// 的过滤条件自然恢复可用，无需重启或外部干预。冷却状态**不持久化**——
+    /// 设计意图：这是分钟级瞬态状态，进程重启耗时已远超典型冷却窗口。
+    ///
+    /// # Arguments
+    /// * `id` - 凭据 ID
+    /// * `cooldown` - 冷却时长（建议风控类 429 用 10 分钟，普通 429 用 60 秒）
+    ///
+    /// # Returns
+    /// 调用后是否还有可用凭据（未禁用且未冷却），便于调用方判断要不要继续切换重试
+    pub fn report_rate_limited(&self, id: u64, cooldown: StdDuration) -> bool {
+        let mut entries = self.entries.lock();
+        let now = Utc::now();
+        let until = now + Duration::from_std(cooldown).unwrap_or(Duration::seconds(60));
+
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.cooldown_until = Some(until);
+            entry.last_used_at = Some(now.to_rfc3339());
+            tracing::warn!(
+                "凭据 #{} 被上游限流，冷却 {} 秒至 {}",
+                id,
+                cooldown.as_secs(),
+                until.to_rfc3339()
+            );
+        }
+
+        entries
+            .iter()
+            .any(|e| !e.disabled && e.cooldown_until.map_or(true, |t| now >= t))
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据，与 API 401/403 的累计失败策略一致；
@@ -1652,6 +1696,7 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                cooldown_until: None,
             });
         }
 
@@ -2268,6 +2313,7 @@ mod tests {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                cooldown_until: None,
             });
         }
 
@@ -2561,5 +2607,79 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ============ 限流冷却测试 ============
+
+    /// 调用 report_rate_limited 后，该凭据在冷却期内不应被 acquire_credential 选中
+    #[test]
+    fn test_report_rate_limited_marks_credential_unavailable_during_cooldown() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.available_count(), 2);
+
+        // 冷却凭据 #1 60 秒，仍剩 #2 可用
+        assert!(manager.report_rate_limited(1, StdDuration::from_secs(60)));
+        assert_eq!(manager.available_count(), 1);
+
+        // 多次 acquire 都不会返回凭据 #1
+        for _ in 0..5 {
+            let (id, _) = manager.acquire_credential(None).expect("应有可用凭据");
+            assert_eq!(id, 2, "冷却中的凭据 #1 不应被选中");
+        }
+    }
+
+    /// 冷却到期后凭据自动恢复可用（无需重启或显式操作）
+    #[test]
+    fn test_report_rate_limited_recovers_after_cooldown_expires() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let manager =
+            MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
+
+        // 唯一凭据被冷却 → 报无可用凭据
+        assert!(!manager.report_rate_limited(1, StdDuration::from_secs(60)));
+        assert_eq!(manager.available_count(), 0);
+
+        // 模拟时间前进：把 cooldown_until 调到过去
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].cooldown_until = Some(Utc::now() - Duration::seconds(1));
+        }
+
+        // 凭据应自动恢复
+        assert_eq!(manager.available_count(), 1);
+        let (id, _) = manager.acquire_credential(None).expect("过期后应可用");
+        assert_eq!(id, 1);
+    }
+
+    /// 所有凭据都被冷却时，acquire_context 应明确报错
+    #[tokio::test]
+    async fn test_report_rate_limited_all_cooled_acquire_context_fails() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert!(manager.report_rate_limited(1, StdDuration::from_secs(60)));
+        assert!(!manager.report_rate_limited(2, StdDuration::from_secs(60)));
+        assert_eq!(manager.available_count(), 0);
+
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .expect("应返回错误")
+            .to_string();
+        assert!(
+            err.contains("所有凭据"),
+            "应提示所有凭据不可用，实际: {}",
+            err
+        );
     }
 }

@@ -237,8 +237,33 @@ impl KiroProvider {
                 continue;
             }
 
-            // 瞬态错误
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 429 - 上游限流：冷却凭据后立即换下一个（详见 call_api_with_retry 同名分支注释）
+            if status.as_u16() == 429 {
+                let is_suspicious = body.contains("suspicious activity");
+                let cooldown = if is_suspicious {
+                    Duration::from_secs(600)
+                } else {
+                    Duration::from_secs(60)
+                };
+                tracing::warn!(
+                    "MCP 请求 429（{}，冷却凭据 #{} {} 秒，尝试 {}/{}）: {}",
+                    if is_suspicious { "风控" } else { "瞬态" },
+                    ctx.id,
+                    cooldown.as_secs(),
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+                let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                if !has_available {
+                    anyhow::bail!("MCP 请求失败（所有凭据均已冷却）: 429 {}", body);
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
+
+            // 408/5xx 瞬态错误：在当前凭据上重试
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -434,9 +459,45 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 429 - 上游限流：冷却当前凭据后立即换下一个，不在同一凭据上重试。
+            // 在同一凭据上重试 429 只会加剧风控判定（Kiro 把高频重试视为可疑活动）。
+            // 风控类 429（响应体含 "suspicious activity"）长冷却 10 分钟，普通 429 短冷却 60 秒。
+            if status.as_u16() == 429 {
+                let is_suspicious = body.contains("suspicious activity");
+                let cooldown = if is_suspicious {
+                    Duration::from_secs(600)
+                } else {
+                    Duration::from_secs(60)
+                };
+                tracing::warn!(
+                    "API 请求 429（{}，冷却凭据 #{} {} 秒，尝试 {}/{}）: {}",
+                    if is_suspicious { "风控" } else { "瞬态" },
+                    ctx.id,
+                    cooldown.as_secs(),
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+                let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据均已冷却）: 429 {}",
+                        api_type,
+                        body
+                    );
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                // 不 sleep：下一轮 acquire_context 会自动跳过冷却中的凭据
+                continue;
+            }
+
+            // 408/5xx - 瞬态上游错误：在当前凭据上重试（避免短暂网络/服务抖动把所有凭据锁死）
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
