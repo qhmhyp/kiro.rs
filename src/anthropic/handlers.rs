@@ -6,12 +6,13 @@ use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::provider::UpstreamError;
 use crate::token;
 use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -27,6 +28,75 @@ use super::prefix_cache::ConvoTokenCache;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+
+/// 上游错误到 HTTP 响应的纯映射（可单测，不涉及 axum Response 类型）
+///
+/// 返回 (http_status, error_type, body_message, optional_response_headers)
+struct UpstreamMapping {
+    status: StatusCode,
+    error_type: &'static str,
+    message: String,
+    upstream_status: Option<u16>,
+    credential_id: u64,
+    body_preview: String,
+    add_retry_after: bool,
+}
+
+fn map_upstream_error(u: &UpstreamError) -> UpstreamMapping {
+    let status = match u.status {
+        Some(429) => StatusCode::TOO_MANY_REQUESTS,
+        Some(s) if (400..500).contains(&s) => {
+            StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY)
+        }
+        // 5xx / 网络错误：CF 会替换 body，但至少 header 还能透传
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let error_type = match u.status {
+        Some(429) => "rate_limit_error",
+        Some(401) => "authentication_error",
+        Some(402) | Some(403) => "permission_error",
+        Some(s) if (400..500).contains(&s) => "invalid_request_error",
+        _ => "api_error",
+    };
+    let upstream_label = u
+        .status
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "network".to_string());
+    let exhausted = if u.all_credentials_exhausted {
+        "（所有凭据已用尽）"
+    } else {
+        ""
+    };
+    let message = format!(
+        "上游 {} 凭据 #{}{}: {}",
+        upstream_label, u.credential_id, exhausted, u.body
+    );
+    UpstreamMapping {
+        status,
+        error_type,
+        message,
+        upstream_status: u.status,
+        credential_id: u.credential_id,
+        body_preview: sanitize_for_header(&u.body, 300),
+        add_retry_after: u.all_credentials_exhausted && status == StatusCode::TOO_MANY_REQUESTS,
+    }
+}
+
+/// 保留 ASCII 可见字符（含空格），其他用 ? 替换；用于放进 HTTP header value
+///
+/// HTTP/1.1 spec 不允许 header value 含非 ASCII，axum 的 HeaderValue::from_str 会拒绝。
+fn sanitize_for_header(s: &str, max_chars: usize) -> String {
+    s.chars()
+        .map(|c| {
+            if c == ' ' || (c.is_ascii_graphic() && c != '\r' && c != '\n') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .take(max_chars)
+        .collect()
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -57,7 +127,48 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
-    tracing::error!("Kiro API 调用失败: {}", err);
+
+    // 结构化上游错误：按真实状态码透传，并通过 header 携带诊断信息
+    // （前面有反代 / CF 时，5xx body 会被替换，但 header 默认透传）
+    if let Some(u) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<UpstreamError>())
+    {
+        let mapping = map_upstream_error(u);
+        tracing::error!(
+            upstream_status = ?mapping.upstream_status,
+            credential = mapping.credential_id,
+            exhausted = u.all_credentials_exhausted,
+            "Kiro API 调用失败: {}",
+            err
+        );
+        let mut response = (
+            mapping.status,
+            Json(ErrorResponse::new(mapping.error_type, mapping.message)),
+        )
+            .into_response();
+        let headers = response.headers_mut();
+        if let Some(s) = mapping.upstream_status {
+            if let Ok(v) = HeaderValue::from_str(&s.to_string()) {
+                headers.insert(HeaderName::from_static("x-upstream-status"), v);
+            }
+        }
+        if let Ok(v) = HeaderValue::from_str(&mapping.credential_id.to_string()) {
+            headers.insert(HeaderName::from_static("x-upstream-credential"), v);
+        }
+        if !mapping.body_preview.is_empty() {
+            if let Ok(v) = HeaderValue::from_str(&mapping.body_preview) {
+                headers.insert(HeaderName::from_static("x-upstream-body"), v);
+            }
+        }
+        if mapping.add_retry_after {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        }
+        return response;
+    }
+
+    // 未结构化错误（不应常态出现）兜底
+    tracing::error!("Kiro API 调用失败（无结构化上游信息）: {}", err);
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
@@ -998,4 +1109,90 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err_for(status: Option<u16>, body: &str, exhausted: bool) -> UpstreamError {
+        let mut e = UpstreamError::new(status, body, 4);
+        if exhausted {
+            e = e.exhausted();
+        }
+        e
+    }
+
+    #[test]
+    fn maps_upstream_429_to_too_many_requests() {
+        let u = err_for(Some(429), "Due to suspicious activity", false);
+        let m = map_upstream_error(&u);
+        assert_eq!(m.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(m.error_type, "rate_limit_error");
+        assert!(m.message.contains("429"));
+        assert!(m.message.contains("suspicious activity"));
+        assert_eq!(m.upstream_status, Some(429));
+        assert_eq!(m.credential_id, 4);
+        assert!(!m.add_retry_after, "单次 429 不应加 Retry-After");
+    }
+
+    #[test]
+    fn exhausted_429_adds_retry_after() {
+        let u = err_for(Some(429), "all cooled", true);
+        let m = map_upstream_error(&u);
+        assert_eq!(m.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(m.add_retry_after, "全凭据冷却时应加 Retry-After");
+        assert!(m.message.contains("所有凭据已用尽"));
+    }
+
+    #[test]
+    fn maps_upstream_401_to_unauthorized() {
+        let u = err_for(Some(401), "invalid token", false);
+        let m = map_upstream_error(&u);
+        assert_eq!(m.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(m.error_type, "authentication_error");
+    }
+
+    #[test]
+    fn maps_upstream_402_to_payment_required() {
+        let u = err_for(Some(402), "MONTHLY_REQUEST_COUNT", true);
+        let m = map_upstream_error(&u);
+        assert_eq!(m.status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(m.error_type, "permission_error");
+    }
+
+    #[test]
+    fn maps_upstream_5xx_to_bad_gateway() {
+        let u = err_for(Some(503), "service unavailable", false);
+        let m = map_upstream_error(&u);
+        assert_eq!(m.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(m.error_type, "api_error");
+    }
+
+    #[test]
+    fn maps_network_error_to_bad_gateway() {
+        let u = err_for(None, "connection reset by peer", false);
+        let m = map_upstream_error(&u);
+        assert_eq!(m.status, StatusCode::BAD_GATEWAY);
+        assert!(m.message.contains("network"));
+    }
+
+    #[test]
+    fn sanitize_for_header_strips_non_ascii_and_control_chars() {
+        let s = sanitize_for_header("hello\n中文\tworld\r行", 100);
+        assert!(!s.contains('\n'));
+        assert!(!s.contains('\t'));
+        assert!(!s.contains('\r'));
+        // ASCII 可见字符保留
+        assert!(s.contains("hello"));
+        assert!(s.contains("world"));
+        // 非 ASCII 字符变成 ?
+        assert!(s.contains('?'));
+    }
+
+    #[test]
+    fn sanitize_for_header_respects_max_chars() {
+        let s = sanitize_for_header(&"a".repeat(500), 100);
+        assert_eq!(s.len(), 100);
+    }
 }

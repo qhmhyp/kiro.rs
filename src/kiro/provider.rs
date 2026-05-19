@@ -26,6 +26,80 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 上游错误结构化信息（通过 [`anyhow::Error::downcast_ref`] 获取）
+///
+/// 用于让 HTTP handler 把上游真实状态码与响应体透传给客户端，
+/// 而不是统一吞成 502（CF / 反代会替换 5xx body，错误信息丢失）。
+#[derive(Debug, Clone)]
+pub struct UpstreamError {
+    /// 上游 HTTP 状态码；网络层 / 链路错误时为 None
+    pub status: Option<u16>,
+    /// 上游响应体或错误描述（已截断到 ~1KB，按字符截断避免 UTF-8 边界 panic）
+    pub body: String,
+    /// 触发错误时所用的凭据 ID（便于排查到具体账号）
+    pub credential_id: u64,
+    /// true 表示所有凭据都已用尽（被禁用 / 配额耗尽 / 冷却中）
+    pub all_credentials_exhausted: bool,
+}
+
+impl UpstreamError {
+    /// 按字符（非字节）截断 body，避免在 UTF-8 多字节字符边界 panic
+    fn truncate_body(body: &str, max_chars: usize) -> String {
+        if body.chars().count() > max_chars {
+            let mut s: String = body.chars().take(max_chars).collect();
+            s.push_str("...");
+            s
+        } else {
+            body.to_string()
+        }
+    }
+
+    /// 构造一个上游错误，body 自动截断到 1KB
+    pub fn new(status: Option<u16>, body: &str, credential_id: u64) -> Self {
+        Self {
+            status,
+            body: Self::truncate_body(body, 1024),
+            credential_id,
+            all_credentials_exhausted: false,
+        }
+    }
+
+    /// 标记"所有凭据已用尽"——handler 据此给客户端加 Retry-After
+    pub fn exhausted(mut self) -> Self {
+        self.all_credentials_exhausted = true;
+        self
+    }
+
+    /// 包装成 anyhow::Error，便于沿用现有的 anyhow::Result 签名
+    pub fn into_anyhow(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let exhausted = if self.all_credentials_exhausted {
+            "（所有凭据已用尽）"
+        } else {
+            ""
+        };
+        match self.status {
+            Some(s) => write!(
+                f,
+                "上游返回 {} （凭据 #{}{}）: {}",
+                s, self.credential_id, exhausted, self.body
+            ),
+            None => write!(
+                f,
+                "上游链路错误 （凭据 #{}{}）: {}",
+                self.credential_id, exhausted, self.body
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UpstreamError {}
+
 /// 单凭据验证结果（[`KiroProvider::send_once_with_credential`] 的返回值）
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -309,7 +383,8 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    last_error = Some(e.into());
+                    last_error =
+                        Some(UpstreamError::new(None, &e.to_string(), ctx.id).into_anyhow());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -332,15 +407,18 @@ impl KiroProvider {
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id)
+                        .exhausted()
+                        .into_anyhow());
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error =
+                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                return Err(UpstreamError::new(Some(400), &body, ctx.id).into_anyhow());
             }
 
             // 401/403 凭据问题
@@ -358,9 +436,12 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id)
+                        .exhausted()
+                        .into_anyhow());
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error =
+                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 continue;
             }
 
@@ -383,9 +464,11 @@ impl KiroProvider {
                 );
                 let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据均已冷却）: 429 {}", body);
+                    return Err(UpstreamError::new(Some(429), &body, ctx.id)
+                        .exhausted()
+                        .into_anyhow());
                 }
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = Some(UpstreamError::new(Some(429), &body, ctx.id).into_anyhow());
                 continue;
             }
 
@@ -398,7 +481,8 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error =
+                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -407,11 +491,12 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
-                anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
             }
 
             // 兜底
-            last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+            last_error =
+                Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -493,7 +578,8 @@ impl KiroProvider {
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
+                    last_error =
+                        Some(UpstreamError::new(None, &e.to_string(), ctx.id).into_anyhow());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -524,26 +610,19 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id)
+                        .exhausted()
+                        .into_anyhow());
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error =
+                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 continue;
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamError::new(Some(400), &body, ctx.id).into_anyhow());
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -569,20 +648,13 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id)
+                        .exhausted()
+                        .into_anyhow());
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error =
+                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 continue;
             }
 
@@ -607,18 +679,11 @@ impl KiroProvider {
                 );
                 let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据均已冷却）: 429 {}",
-                        api_type,
-                        body
-                    );
+                    return Err(UpstreamError::new(Some(429), &body, ctx.id)
+                        .exhausted()
+                        .into_anyhow());
                 }
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(UpstreamError::new(Some(429), &body, ctx.id).into_anyhow());
                 // 不 sleep：下一轮 acquire_context 会自动跳过冷却中的凭据
                 continue;
             }
@@ -632,12 +697,8 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error =
+                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -646,7 +707,7 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -657,12 +718,8 @@ impl KiroProvider {
                 status,
                 body
             );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
-            ));
+            last_error =
+                Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
