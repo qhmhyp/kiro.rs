@@ -28,6 +28,7 @@ const MAX_TOTAL_RETRIES: usize = 9;
 
 /// 单凭据验证结果（[`KiroProvider::send_once_with_credential`] 的返回值）
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VerifyOutcome {
     /// 上游返回 2xx 时为 true
     pub ok: bool,
@@ -217,8 +218,11 @@ impl KiroProvider {
                     }
                 } else {
                     let body_text = resp.text().await.unwrap_or_default();
-                    let preview = if body_text.len() > 500 {
-                        format!("{}...", &body_text[..500])
+                    // 按字符（非字节）截断，避免在 UTF-8 多字节字符（CJK / emoji）
+                    // 边界上 panic。`&str[..n]` 是字节索引，越界会 crash 当前请求。
+                    let preview = if body_text.chars().count() > 500 {
+                        let truncated: String = body_text.chars().take(500).collect();
+                        format!("{}...", truncated)
                     } else {
                         body_text
                     };

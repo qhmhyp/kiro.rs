@@ -5,8 +5,7 @@ import {
   Trash2,
   Loader2,
   Wallet,
-  ChevronUp,
-  ChevronDown,
+  KeyRound,
   PlayCircle,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -119,17 +118,6 @@ export function CredentialRow({
           toast.success(res.message)
           setEditingPriority(false)
         },
-        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-      }
-    )
-  }
-
-  const handlePriorityNudge = (delta: number) => {
-    const next = Math.max(0, credential.priority + delta)
-    setPriority.mutate(
-      { id: credential.id, priority: next },
-      {
-        onSuccess: (res) => toast.success(res.message),
         onError: (err) => toast.error('操作失败: ' + (err as Error).message),
       }
     )
@@ -263,33 +251,13 @@ export function CredentialRow({
               </Button>
             </div>
           ) : (
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => handlePriorityNudge(-1)}
-                disabled={setPriority.isPending || credential.priority === 0}
-                className="text-muted-foreground hover:text-foreground disabled:opacity-30"
-                title="提高优先级"
-              >
-                <ChevronUp className="h-3 w-3" />
-              </button>
-              <span
-                className="font-medium text-sm cursor-pointer hover:underline min-w-4 text-center"
-                onClick={() => setEditingPriority(true)}
-                title="点击编辑"
-              >
-                {credential.priority}
-              </span>
-              <button
-                type="button"
-                onClick={() => handlePriorityNudge(1)}
-                disabled={setPriority.isPending}
-                className="text-muted-foreground hover:text-foreground disabled:opacity-30"
-                title="降低优先级"
-              >
-                <ChevronDown className="h-3 w-3" />
-              </button>
-            </div>
+            <span
+              className="font-medium text-sm cursor-pointer hover:underline px-1"
+              onClick={() => setEditingPriority(true)}
+              title="点击编辑优先级"
+            >
+              {credential.priority}
+            </span>
           )}
         </td>
 
@@ -428,8 +396,8 @@ export function CredentialRow({
               }
               title="强制刷新 Token"
             >
-              <RefreshCw
-                className={cn('h-3.5 w-3.5', forceRefresh.isPending && 'animate-spin')}
+              <KeyRound
+                className={cn('h-3.5 w-3.5', forceRefresh.isPending && 'animate-pulse')}
               />
             </Button>
             <Button

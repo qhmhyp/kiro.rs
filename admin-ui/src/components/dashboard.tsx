@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, PlayCircle, Wallet } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -13,7 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, verifyCredentialMessage } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -30,6 +30,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
+  const [hasStartedVerify, setHasStartedVerify] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
@@ -401,39 +402,43 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   // 批量验活
-  const handleBatchVerify = async () => {
+  // 打开批量验证对话框（不立即开跑，先让用户在 dialog 里选模型）
+  const handleOpenBatchVerify = () => {
     if (selectedIds.size === 0) {
-      toast.error('请先选择要验活的凭据')
+      toast.error('请先选择要验证的凭据')
       return
     }
+    setVerifyResults(new Map())
+    setHasStartedVerify(false)
+    setVerifyDialogOpen(true)
+  }
 
-    // 初始化状态
+  // 用 verifyCredentialMessage 对所有选中凭据真实发一次 messages 请求
+  const handleStartBatchVerify = async (model: string) => {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) return
+
+    setHasStartedVerify(true)
     setVerifying(true)
     cancelVerifyRef.current = false
-    const ids = Array.from(selectedIds)
     setVerifyProgress({ current: 0, total: ids.length })
 
-    let successCount = 0
-
-    // 初始化结果，所有凭据状态为 pending
     const initialResults = new Map<number, VerifyResult>()
     ids.forEach(id => {
       initialResults.set(id, { id, status: 'pending' })
     })
     setVerifyResults(initialResults)
-    setVerifyDialogOpen(true)
 
-    // 开始验活
+    let successCount = 0
+
     for (let i = 0; i < ids.length; i++) {
-      // 检查是否取消
       if (cancelVerifyRef.current) {
-        toast.info('已取消验活')
+        toast.info('已取消验证')
         break
       }
 
       const id = ids[i]
 
-      // 更新当前凭据状态为 verifying
       setVerifyResults(prev => {
         const newResults = new Map(prev)
         newResults.set(id, { id, status: 'verifying' })
@@ -441,36 +446,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
 
       try {
-        const balance = await getCredentialBalance(id)
-        successCount++
-
-        // 更新为成功状态
-        setVerifyResults(prev => {
-          const newResults = new Map(prev)
-          newResults.set(id, {
-            id,
-            status: 'success',
-            usage: `${balance.currentUsage}/${balance.usageLimit}`
+        const res = await verifyCredentialMessage(id, model)
+        if (res.ok) {
+          successCount++
+          setVerifyResults(prev => {
+            const newResults = new Map(prev)
+            newResults.set(id, {
+              id,
+              status: 'success',
+              latencyMs: res.latencyMs,
+              statusCode: res.status ?? undefined,
+            })
+            return newResults
           })
-          return newResults
-        })
+        } else {
+          setVerifyResults(prev => {
+            const newResults = new Map(prev)
+            newResults.set(id, {
+              id,
+              status: 'failed',
+              latencyMs: res.latencyMs,
+              statusCode: res.status ?? undefined,
+              error: res.error ?? '未知错误',
+            })
+            return newResults
+          })
+        }
       } catch (error) {
-        // 更新为失败状态
         setVerifyResults(prev => {
           const newResults = new Map(prev)
           newResults.set(id, {
             id,
             status: 'failed',
-            error: extractErrorMessage(error)
+            error: extractErrorMessage(error),
           })
           return newResults
         })
       }
 
-      // 更新进度
       setVerifyProgress({ current: i + 1, total: ids.length })
 
-      // 添加延迟防止封号（最后一个不需要延迟）
+      // 间隔 2 秒避免被风控判定为可疑活动
       if (i < ids.length - 1 && !cancelVerifyRef.current) {
         await new Promise(resolve => setTimeout(resolve, 2000))
       }
@@ -479,11 +495,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
 
     if (!cancelVerifyRef.current) {
-      toast.success(`验活完成：成功 ${successCount}/${ids.length}`)
+      toast.success(`验证完成：成功 ${successCount}/${ids.length}`)
     }
   }
 
-  // 取消验活
   const handleCancelVerify = () => {
     cancelVerifyRef.current = true
     setVerifying(false)
@@ -530,7 +545,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
+            <Button variant="ghost" size="icon" onClick={handleRefresh} title="刷新凭据列表">
               <RefreshCw className="h-5 w-5" />
             </Button>
             <Button variant="ghost" size="icon" onClick={handleLogout}>
@@ -596,9 +611,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <div className="flex gap-2">
               {selectedIds.size > 0 && (
                 <>
-                  <Button onClick={handleBatchVerify} size="sm" variant="outline">
-                    <CheckCircle2 className="h-4 w-4 mr-2" />
-                    批量验活
+                  <Button onClick={handleOpenBatchVerify} size="sm" variant="outline">
+                    <PlayCircle className="h-4 w-4 mr-2" />
+                    批量验证
                   </Button>
                   <Button
                     onClick={handleBatchForceRefresh}
@@ -611,7 +626,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   </Button>
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />
-                    恢复异常
+                    重置失败
                   </Button>
                   <Button
                     onClick={handleBatchDelete}
@@ -627,8 +642,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
               {verifying && !verifyDialogOpen && (
                 <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary">
-                  <CheckCircle2 className="h-4 w-4 mr-2 animate-spin" />
-                  验活中... {verifyProgress.current}/{verifyProgress.total}
+                  <PlayCircle className="h-4 w-4 mr-2 animate-spin" />
+                  验证中... {verifyProgress.current}/{verifyProgress.total}
                 </Button>
               )}
               {data?.credentials && data.credentials.length > 0 && (
@@ -637,9 +652,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   size="sm"
                   variant="outline"
                   disabled={queryingInfo}
+                  title="批量拉取当前页所有启用凭据的余额信息"
                 >
-                  <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                  <Wallet className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-pulse' : ''}`} />
+                  {queryingInfo ? `刷新中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '刷新余额'}
                 </Button>
               )}
               {data?.credentials && data.credentials.length > 0 && (
@@ -762,13 +778,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setKamImportDialogOpen}
       />
 
-      {/* 批量验活对话框 */}
+      {/* 批量验证对话框 */}
       <BatchVerifyDialog
         open={verifyDialogOpen}
         onOpenChange={setVerifyDialogOpen}
+        hasStarted={hasStartedVerify}
         verifying={verifying}
         progress={verifyProgress}
         results={verifyResults}
+        selectedCount={selectedIds.size}
+        onStart={handleStartBatchVerify}
         onCancel={handleCancelVerify}
       />
     </div>
