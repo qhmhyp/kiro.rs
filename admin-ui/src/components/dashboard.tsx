@@ -6,6 +6,7 @@ import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Checkbox } from '@/components/ui/checkbox'
 import { CredentialRow } from '@/components/credential-row'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
@@ -139,6 +140,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const deselectAll = () => {
     setSelectedIds(new Set())
   }
+
+  // 当前页全选 / 取消全选（不影响其他页已选中的项）
+  const toggleSelectAllOnPage = () => {
+    const pageIds = currentCredentials.map(c => c.id)
+    const allOnPageSelected = pageIds.length > 0 && pageIds.every(id => selectedIds.has(id))
+    const newSelected = new Set(selectedIds)
+    if (allOnPageSelected) {
+      pageIds.forEach(id => newSelected.delete(id))
+    } else {
+      pageIds.forEach(id => newSelected.add(id))
+    }
+    setSelectedIds(newSelected)
+  }
+
+  // 当前页选择状态：false / true / "indeterminate"
+  const pageSelectionState: boolean | 'indeterminate' = (() => {
+    if (currentCredentials.length === 0) return false
+    const count = currentCredentials.filter(c => selectedIds.has(c.id)).length
+    if (count === 0) return false
+    if (count === currentCredentials.length) return true
+    return 'indeterminate'
+  })()
 
   // 批量删除（仅删除已禁用项）
   const handleBatchDelete = async () => {
@@ -697,7 +720,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <table className="w-full text-sm">
                   <thead className="bg-muted/50 text-xs text-muted-foreground">
                     <tr className="border-b">
-                      <th className="px-2 py-2 text-left font-medium w-8"></th>
+                      <th className="px-2 py-2 text-left font-medium w-8">
+                        <Checkbox
+                          checked={pageSelectionState}
+                          onCheckedChange={toggleSelectAllOnPage}
+                          aria-label="选择当前页全部凭据"
+                        />
+                      </th>
                       <th className="px-2 py-2 text-left font-medium">凭据</th>
                       <th className="px-2 py-2 text-left font-medium">订阅</th>
                       <th className="px-2 py-2 text-left font-medium">优先级</th>
