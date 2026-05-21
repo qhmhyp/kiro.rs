@@ -27,6 +27,9 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  name?: string
+  cooldownUntil?: string
+  lastError?: RecentError
 }
 
 // 余额响应
@@ -80,6 +83,13 @@ export interface AddCredentialRequest {
   endpoint?: string
 }
 
+// 最近一次上游错误（成功调用会清空）
+export interface RecentError {
+  at: string
+  status?: number | null
+  bodyPreview: string
+}
+
 // 添加凭据响应
 export interface AddCredentialResponse {
   success: boolean
@@ -99,6 +109,7 @@ export interface VerifyMessageResponse {
 // 凭据部分更新请求（PATCH /credentials/:id）
 // 字段语义：undefined = 不修改；"" = 清空；其他 = 设为新值
 export interface UpdateCredentialRequest {
+  name?: string
   refreshToken?: string
   kiroApiKey?: string
   profileArn?: string

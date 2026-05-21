@@ -74,6 +74,60 @@ function authMethodLabel(method?: string): string {
   return method ?? '-'
 }
 
+type StatusKind = 'ok' | 'failing' | 'cooldown' | 'disabled'
+
+interface StatusBadge {
+  kind: StatusKind
+  label: string
+  /** 鼠标悬停的详细信息 */
+  tooltip: string
+}
+
+/** 综合 disabled / cooldown / failure_count / last_error 输出状态徽章 */
+function computeStatus(credential: CredentialStatusItem): StatusBadge | null {
+  if (credential.disabled) {
+    return {
+      kind: 'disabled',
+      label: credential.disabledReason ?? '已禁用',
+      tooltip: `凭据已禁用${credential.disabledReason ? `（原因：${credential.disabledReason}）` : ''}${
+        credential.lastError ? `\n最近错误：${formatLastError(credential.lastError)}` : ''
+      }`,
+    }
+  }
+  if (credential.cooldownUntil) {
+    const remainingSec = Math.max(
+      0,
+      Math.floor((new Date(credential.cooldownUntil).getTime() - Date.now()) / 1000)
+    )
+    if (remainingSec > 0) {
+      return {
+        kind: 'cooldown',
+        label: remainingSec >= 60 ? `冷却 ${Math.ceil(remainingSec / 60)}m` : `冷却 ${remainingSec}s`,
+        tooltip: `限流冷却中，约 ${remainingSec}s 后恢复${
+          credential.lastError ? `\n最近错误：${formatLastError(credential.lastError)}` : ''
+        }`,
+      }
+    }
+  }
+  const failTotal = credential.failureCount + credential.refreshFailureCount
+  if (failTotal > 0) {
+    return {
+      kind: 'failing',
+      label: `失败 ${failTotal}/3`,
+      tooltip: `连续失败累积中（API ${credential.failureCount} / 刷新 ${credential.refreshFailureCount}），达 3 次将禁用${
+        credential.lastError ? `\n最近错误：${formatLastError(credential.lastError)}` : ''
+      }`,
+    }
+  }
+  return null
+}
+
+function formatLastError(e: NonNullable<CredentialStatusItem['lastError']>): string {
+  const at = new Date(e.at).toLocaleString()
+  const status = e.status != null ? `HTTP ${e.status}` : '网络错误'
+  return `${status} @ ${at}\n${e.bodyPreview}`
+}
+
 export function CredentialRow({
   credential,
   onViewBalance,
@@ -188,12 +242,12 @@ export function CredentialRow({
           <Checkbox checked={selected} onCheckedChange={onToggleSelect} />
         </td>
 
-        {/* ID / 邮箱 */}
+        {/* ID / 名称 / 邮箱 */}
         <td className="px-2 py-2">
           <div className="flex flex-col">
             <div className="flex items-center gap-1.5">
               <span className="font-medium text-sm">
-                {credential.email || `#${credential.id}`}
+                {credential.name || credential.email || `#${credential.id}`}
               </span>
               {credential.isCurrent && (
                 <Badge variant="success" className="h-4 px-1 text-[10px]">当前</Badge>
@@ -201,6 +255,11 @@ export function CredentialRow({
             </div>
             <div className="flex flex-wrap items-center gap-1 mt-0.5">
               <span className="text-[10px] text-muted-foreground">#{credential.id}</span>
+              {credential.name && credential.email && (
+                <span className="text-[10px] text-muted-foreground truncate max-w-[140px]" title={credential.email}>
+                  {credential.email}
+                </span>
+              )}
               {credential.authMethod && (
                 <Badge variant="secondary" className="h-4 px-1 text-[10px]">
                   {authMethodLabel(credential.authMethod)}
@@ -269,11 +328,33 @@ export function CredentialRow({
               onCheckedChange={handleToggleDisabled}
               disabled={setDisabled.isPending}
             />
-            {credential.disabled && credential.disabledReason && (
-              <Badge variant="outline" className="h-4 px-1 text-[10px]">
-                {credential.disabledReason}
-              </Badge>
-            )}
+            {(() => {
+              const s = computeStatus(credential)
+              if (!s) {
+                return (
+                  <Badge variant="success" className="h-4 px-1 text-[10px]" title="状态正常">
+                    🟢 正常
+                  </Badge>
+                )
+              }
+              const variant =
+                s.kind === 'disabled'
+                  ? 'destructive'
+                  : s.kind === 'cooldown'
+                    ? 'secondary'
+                    : 'outline'
+              const emoji =
+                s.kind === 'disabled' ? '🔴' : s.kind === 'cooldown' ? '⏱' : '🟡'
+              return (
+                <Badge
+                  variant={variant}
+                  className="h-4 px-1 text-[10px] cursor-help"
+                  title={s.tooltip}
+                >
+                  {emoji} {s.label}
+                </Badge>
+              )
+            })()}
           </div>
         </td>
 

@@ -416,6 +416,20 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// 限流冷却到期时间。Some 且 > now 时该凭据暂时不可用；不持久化。
     cooldown_until: Option<DateTime<Utc>>,
+    /// 最近一次上游错误。成功请求会清空。用于 admin UI 展示"凭据当前状态"。不持久化。
+    last_error: Option<RecentError>,
+}
+
+/// 凭据最近一次上游错误（用于状态展示）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentError {
+    /// 错误发生时间（RFC3339）
+    pub at: String,
+    /// 上游 HTTP 状态码；网络层错误时 None
+    pub status: Option<u16>,
+    /// 错误体摘要（按字符截断到 256）
+    pub body_preview: String,
 }
 
 /// 部分更新凭据的请求载荷（送给 [`MultiTokenManager::update_credential`]）
@@ -423,6 +437,7 @@ struct CredentialEntry {
 /// 字符串字段语义：`None` = 不修改；`Some("")` = 清空；`Some(value)` = 设为新值。
 #[derive(Debug, Default, Clone)]
 pub struct CredentialUpdate {
+    pub name: Option<String>,
     pub refresh_token: Option<String>,
     pub kiro_api_key: Option<String>,
     pub profile_arn: Option<String>,
@@ -511,6 +526,15 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 用户自定义名称（前端优先于 email 显示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 限流冷却到期时间（RFC3339）；当前时刻晚于此值前该凭据被排除调度
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    /// 最近一次上游错误（成功调用后清空）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<RecentError>,
 }
 
 /// 凭据管理器状态快照
@@ -633,6 +657,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     cooldown_until: None,
+                    last_error: None,
                 }
             })
             .collect();
@@ -1137,6 +1162,8 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
+                // 成功一次后清空"最近错误"，状态徽章回归正常
+                entry.last_error = None;
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -1145,6 +1172,27 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 记录指定凭据的最近一次上游错误（用于 admin UI 状态展示）
+    ///
+    /// 与 [`Self::report_failure`] / [`Self::report_rate_limited`] 等独立——
+    /// 那些方法负责"是否禁用 / 是否冷却"决策，本方法只更新展示用的"最近错误"快照。
+    /// Provider 在每次失败分支调一次，与 report_* 系列配合使用。
+    pub fn set_last_error(&self, id: u64, status: Option<u16>, body: &str) {
+        let preview: String = if body.chars().count() > 256 {
+            body.chars().take(256).collect::<String>() + "..."
+        } else {
+            body.to_string()
+        };
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.last_error = Some(RecentError {
+                at: Utc::now().to_rfc3339(),
+                status,
+                body_preview: preview,
+            });
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1452,6 +1500,9 @@ impl MultiTokenManager {
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    name: e.credentials.name.clone(),
+                    cooldown_until: e.cooldown_until.map(|t| t.to_rfc3339()),
+                    last_error: e.last_error.clone(),
                 })
                 .collect(),
             current_id,
@@ -1537,6 +1588,7 @@ impl MultiTokenManager {
                 apply(&mut c.kiro_api_key, &update.kiro_api_key);
                 invalidate_token = true;
             }
+            apply(&mut c.name, &update.name);
             apply(&mut c.profile_arn, &update.profile_arn);
             apply(&mut c.client_id, &update.client_id);
             apply(&mut c.client_secret, &update.client_secret);
@@ -1817,6 +1869,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 cooldown_until: None,
+                    last_error: None,
             });
         }
 
@@ -2434,6 +2487,7 @@ mod tests {
                 success_count: 0,
                 last_used_at: None,
                 cooldown_until: None,
+                    last_error: None,
             });
         }
 

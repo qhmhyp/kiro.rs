@@ -62,6 +62,15 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 用户自定义名称（前端优先于 email 显示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 限流冷却到期时间（RFC3339），到期前该凭据不参与调度
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    /// 最近一次上游错误快照（成功调用后清空）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<crate::kiro::token_manager::RecentError>,
 }
 
 // ============ 操作请求 ============
@@ -91,6 +100,7 @@ pub struct VerifyMessageRequest {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateCredentialRequest {
+    pub name: Option<String>,
     pub refresh_token: Option<String>,
     pub kiro_api_key: Option<String>,
     pub profile_arn: Option<String>,
