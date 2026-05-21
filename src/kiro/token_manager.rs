@@ -569,6 +569,17 @@ pub struct CallContext {
     pub token: String,
 }
 
+/// 判断单个凭据当下是否可用（未禁用 且 未在限流冷却中）
+fn entry_is_available_now(entry: &CredentialEntry, now: DateTime<Utc>) -> bool {
+    !entry.disabled && entry.cooldown_until.map_or(true, |t| now >= t)
+}
+
+/// 在持有 entries 锁的上下文中判断是否还有可用凭据
+fn any_entry_available(entries: &[CredentialEntry]) -> bool {
+    let now = Utc::now();
+    entries.iter().any(|e| entry_is_available_now(e, now))
+}
+
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
     ///
@@ -710,7 +721,7 @@ impl MultiTokenManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && e.cooldown_until.map_or(true, |t| now >= t))
+            .filter(|e| entry_is_available_now(e, now))
             .count()
     }
 
@@ -1150,11 +1161,11 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return any_entry_available(&entries),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return any_entry_available(&entries);
             }
 
             entry.failure_count += 1;
@@ -1174,13 +1185,13 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 just_disabled = true;
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
-                if !entries.iter().any(|e| !e.disabled) {
+                if !any_entry_available(&entries) {
                     tracing::error!("所有凭据均已禁用！");
                 }
             }
 
             (
-                entries.iter().any(|e| !e.disabled),
+                any_entry_available(&entries),
                 just_disabled,
             )
         };
@@ -1205,11 +1216,11 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return any_entry_available(&entries),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return any_entry_available(&entries);
             }
 
             entry.disabled = true;
@@ -1220,7 +1231,7 @@ impl MultiTokenManager {
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
-            let has_available = entries.iter().any(|e| !e.disabled);
+            let has_available = any_entry_available(&entries);
             if !has_available {
                 tracing::error!("所有凭据均已禁用！");
             }
@@ -1278,12 +1289,12 @@ impl MultiTokenManager {
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
                 None => {
-                    return entries.iter().any(|e| !e.disabled);
+                    return any_entry_available(&entries);
                 }
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return any_entry_available(&entries);
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -1298,7 +1309,7 @@ impl MultiTokenManager {
             );
 
             if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                (entries.iter().any(|e| !e.disabled), false)
+                (any_entry_available(&entries), false)
             } else {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
@@ -1309,7 +1320,7 @@ impl MultiTokenManager {
                     refresh_failure_count
                 );
 
-                let has_available = entries.iter().any(|e| !e.disabled);
+                let has_available = any_entry_available(&entries);
                 if !has_available {
                     tracing::error!("所有凭据均已禁用！");
                 }
@@ -1334,11 +1345,11 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return any_entry_available(&entries),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return any_entry_available(&entries);
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -1350,7 +1361,7 @@ impl MultiTokenManager {
                 id
             );
 
-            let has_available = entries.iter().any(|e| !e.disabled);
+            let has_available = any_entry_available(&entries);
             if !has_available {
                 tracing::error!("所有凭据均已禁用！");
             }
@@ -1380,7 +1391,11 @@ impl MultiTokenManager {
             .max_by(|a, b| a.last_used_at.cmp(&b.last_used_at))
             .map(|e| e.id)
             .unwrap_or(0);
-        let available = entries.iter().filter(|e| !e.disabled).count();
+        let now = Utc::now();
+        let available = entries
+            .iter()
+            .filter(|e| entry_is_available_now(e, now))
+            .count();
 
         ManagerSnapshot {
             entries: entries
@@ -2974,5 +2989,57 @@ mod tests {
         let entries = manager.entries.lock();
         let e = entries.iter().find(|e| e.id == 1).unwrap();
         assert_eq!(e.credentials.priority, 5);
+    }
+
+    // ============ snapshot / report_* 的 cooldown 一致性测试 ============
+
+    /// snapshot().available 必须排除冷却中的凭据（之前只过滤 disabled，admin UI 会虚高）
+    #[test]
+    fn test_snapshot_available_count_excludes_cooled_down_credentials() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.snapshot().available, 2);
+
+        manager.report_rate_limited(1, StdDuration::from_secs(60));
+        assert_eq!(
+            manager.snapshot().available,
+            1,
+            "冷却中的凭据不应计入 available"
+        );
+
+        manager.report_rate_limited(2, StdDuration::from_secs(60));
+        assert_eq!(manager.snapshot().available, 0);
+    }
+
+    /// report_failure 的返回值"是否还有可用凭据"必须排除冷却中的；
+    /// 否则调用方拿到 true 然后 acquire_credential 立刻返 None，导致不一致
+    #[test]
+    fn test_report_failure_returns_false_when_remaining_are_cooled_down() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // cred2 进入冷却，剩 cred1 健康
+        manager.report_rate_limited(2, StdDuration::from_secs(60));
+        assert_eq!(manager.available_count(), 1);
+
+        // 把 cred1 一次失败（未达禁用阈值）：仍可用，但其他凭据都冷却 → 返回 true 仍可继续重试 cred1
+        assert!(manager.report_failure(1));
+
+        // 持续 fail 把 cred1 也禁用（达 MAX_FAILURES_PER_CREDENTIAL）→ 应返 false
+        for _ in 0..(MAX_FAILURES_PER_CREDENTIAL - 1) {
+            manager.report_failure(1);
+        }
+        // 此刻 cred1 已 disabled，cred2 还在冷却中 → 没有任何可用凭据
+        assert!(
+            !manager.report_failure(1),
+            "cred1 已禁用且 cred2 在冷却中，应返回 false（无可用凭据）"
+        );
     }
 }
