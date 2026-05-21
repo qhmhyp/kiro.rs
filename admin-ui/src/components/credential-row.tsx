@@ -371,13 +371,10 @@ export function CredentialRow({
                   onError: (err) => toast.error('操作失败: ' + (err as Error).message),
                 })
               }
-              disabled={
-                resetFailure.isPending ||
-                (credential.failureCount === 0 && credential.refreshFailureCount === 0)
-              }
-              title="重置失败计数"
+              disabled={resetFailure.isPending}
+              title="重置失败计数并尝试启用（对 Manual / InvalidConfig 禁用无效）"
             >
-              <RefreshCw className="h-3.5 w-3.5" />
+              <RefreshCw className={cn('h-3.5 w-3.5', resetFailure.isPending && 'animate-spin')} />
             </Button>
             <Button
               size="sm"
