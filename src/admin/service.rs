@@ -10,12 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::provider::{KiroProvider, VerifyOutcome};
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialUpdate, MultiTokenManager};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse,
+    CredentialsStatusResponse, UpdateCredentialRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -421,6 +421,56 @@ impl AdminService {
             AdminServiceError::NotFound { id }
         } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
             AdminServiceError::InvalidCredential(msg)
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
+    }
+
+    /// 部分更新凭据（PATCH /credentials/:id）
+    ///
+    /// 校验 endpoint 是否在已知列表中，然后转发到 token_manager。
+    pub fn update_credential(
+        &self,
+        id: u64,
+        req: UpdateCredentialRequest,
+    ) -> Result<(), AdminServiceError> {
+        // endpoint 校验：Some(非空字符串) 时必须是已知端点
+        if let Some(endpoint) = &req.endpoint {
+            if !endpoint.is_empty() && !self.known_endpoints.contains(endpoint) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点: {}",
+                    endpoint
+                )));
+            }
+        }
+
+        let update = CredentialUpdate {
+            refresh_token: req.refresh_token,
+            kiro_api_key: req.kiro_api_key,
+            profile_arn: req.profile_arn,
+            client_id: req.client_id,
+            client_secret: req.client_secret,
+            region: req.region,
+            auth_region: req.auth_region,
+            api_region: req.api_region,
+            machine_id: req.machine_id,
+            email: req.email,
+            proxy_url: req.proxy_url,
+            proxy_username: req.proxy_username,
+            proxy_password: req.proxy_password,
+            endpoint: req.endpoint,
+            priority: req.priority,
+        };
+
+        self.token_manager
+            .update_credential(id, update)
+            .map_err(|e| Self::token_manager_error_to_admin(id, e))
+    }
+
+    fn token_manager_error_to_admin(id: u64, err: anyhow::Error) -> AdminServiceError {
+        let msg = err.to_string();
+        if msg.contains("不存在") {
+            AdminServiceError::NotFound { id }
         } else {
             AdminServiceError::InternalError(msg)
         }

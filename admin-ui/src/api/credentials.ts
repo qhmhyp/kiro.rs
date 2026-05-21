@@ -8,6 +8,7 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  UpdateCredentialRequest,
   VerifyMessageResponse,
 } from '@/types/api'
 
@@ -103,6 +104,15 @@ export async function verifyCredentialMessage(
     `/credentials/${id}/verify-message`,
     { model }
   )
+  return data
+}
+
+// 部分更新凭据字段
+export async function updateCredential(
+  id: number,
+  payload: UpdateCredentialRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.patch<SuccessResponse>(`/credentials/${id}`, payload)
   return data
 }
 

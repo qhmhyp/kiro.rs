@@ -418,6 +418,28 @@ struct CredentialEntry {
     cooldown_until: Option<DateTime<Utc>>,
 }
 
+/// 部分更新凭据的请求载荷（送给 [`MultiTokenManager::update_credential`]）
+///
+/// 字符串字段语义：`None` = 不修改；`Some("")` = 清空；`Some(value)` = 设为新值。
+#[derive(Debug, Default, Clone)]
+pub struct CredentialUpdate {
+    pub refresh_token: Option<String>,
+    pub kiro_api_key: Option<String>,
+    pub profile_arn: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub region: Option<String>,
+    pub auth_region: Option<String>,
+    pub api_region: Option<String>,
+    pub machine_id: Option<String>,
+    pub email: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+    pub endpoint: Option<String>,
+    pub priority: Option<u32>,
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -1460,6 +1482,69 @@ impl MultiTokenManager {
             entry.credentials.priority = priority;
         }
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 部分更新凭据字段（Admin API PATCH /credentials/:id）
+    ///
+    /// 字段语义：`None` = 不修改；`Some("")` = 清空（重置为 None）；`Some(value)` = 设为新值。
+    /// 改了 `refresh_token` 或 `kiro_api_key` 时会清掉旧 access_token / expires_at，
+    /// 下一次请求触发刷新流程。`authMethod` 不可改（请删除后重新添加）。
+    /// endpoint 校验由调用方在调用本方法前完成。
+    pub fn update_credential(&self, id: u64, update: CredentialUpdate) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            let c = &mut entry.credentials;
+
+            // 字符串字段：Some("") = 清空，Some(s) = 覆盖
+            fn apply(target: &mut Option<String>, val: &Option<String>) {
+                if let Some(s) = val {
+                    if s.is_empty() {
+                        *target = None;
+                    } else {
+                        *target = Some(s.clone());
+                    }
+                }
+            }
+
+            let mut invalidate_token = false;
+            if update.refresh_token.is_some() {
+                apply(&mut c.refresh_token, &update.refresh_token);
+                invalidate_token = true;
+            }
+            if update.kiro_api_key.is_some() {
+                apply(&mut c.kiro_api_key, &update.kiro_api_key);
+                invalidate_token = true;
+            }
+            apply(&mut c.profile_arn, &update.profile_arn);
+            apply(&mut c.client_id, &update.client_id);
+            apply(&mut c.client_secret, &update.client_secret);
+            apply(&mut c.region, &update.region);
+            apply(&mut c.auth_region, &update.auth_region);
+            apply(&mut c.api_region, &update.api_region);
+            apply(&mut c.machine_id, &update.machine_id);
+            apply(&mut c.email, &update.email);
+            apply(&mut c.proxy_url, &update.proxy_url);
+            apply(&mut c.proxy_username, &update.proxy_username);
+            apply(&mut c.proxy_password, &update.proxy_password);
+            apply(&mut c.endpoint, &update.endpoint);
+
+            if let Some(p) = update.priority {
+                c.priority = p;
+            }
+
+            // 鉴权字段改了：让旧 access_token 失效，下次请求自动走 try_ensure_token 刷新
+            if invalidate_token {
+                c.access_token = None;
+                c.expires_at = None;
+            }
+        }
         self.persist_credentials()?;
         Ok(())
     }
@@ -2763,5 +2848,131 @@ mod tests {
             "应提示所有凭据不可用，实际: {}",
             err
         );
+    }
+
+    // ============ update_credential 测试 ============
+
+    /// 部分字段更新：未指定字段保持原值
+    #[test]
+    fn test_update_credential_partial_only_touches_specified_fields() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("rt-original".to_string());
+        cred.proxy_url = Some("http://proxy1:8080".to_string());
+        cred.region = Some("us-east-1".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let update = CredentialUpdate {
+            proxy_url: Some("http://proxy2:8080".to_string()),
+            ..Default::default()
+        };
+        manager.update_credential(1, update).unwrap();
+
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.credentials.proxy_url.as_deref(), Some("http://proxy2:8080"));
+        assert_eq!(e.credentials.refresh_token.as_deref(), Some("rt-original"));
+        assert_eq!(e.credentials.region.as_deref(), Some("us-east-1"));
+    }
+
+    /// Some("") 清空字段
+    #[test]
+    fn test_update_credential_empty_string_clears_field() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("rt".to_string());
+        cred.proxy_url = Some("http://proxy:8080".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let update = CredentialUpdate {
+            proxy_url: Some(String::new()),
+            ..Default::default()
+        };
+        manager.update_credential(1, update).unwrap();
+
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(e.credentials.proxy_url.is_none(), "空字符串应清空 proxy_url");
+    }
+
+    /// 改 refresh_token 应清掉 access_token / expires_at
+    #[test]
+    fn test_update_credential_refresh_token_invalidates_access_token() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("at-old".to_string());
+        cred.refresh_token = Some("rt-old".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let update = CredentialUpdate {
+            refresh_token: Some("rt-new".to_string()),
+            ..Default::default()
+        };
+        manager.update_credential(1, update).unwrap();
+
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.credentials.refresh_token.as_deref(), Some("rt-new"));
+        assert!(e.credentials.access_token.is_none(), "改 refresh_token 后应清空 access_token");
+        assert!(e.credentials.expires_at.is_none(), "改 refresh_token 后应清空 expires_at");
+    }
+
+    /// 改 kiro_api_key 也应清掉旧 access_token
+    #[test]
+    fn test_update_credential_kiro_api_key_invalidates_access_token() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("at-old".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let update = CredentialUpdate {
+            kiro_api_key: Some("ksk_new".to_string()),
+            ..Default::default()
+        };
+        manager.update_credential(1, update).unwrap();
+
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.credentials.kiro_api_key.as_deref(), Some("ksk_new"));
+        assert!(e.credentials.access_token.is_none());
+    }
+
+    /// 不存在的 id 应返回错误
+    #[test]
+    fn test_update_credential_unknown_id_errors() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let err = manager
+            .update_credential(999, CredentialUpdate::default())
+            .err()
+            .expect("应返回错误");
+        assert!(err.to_string().contains("不存在"));
+    }
+
+    /// 更新 priority 应生效
+    #[test]
+    fn test_update_credential_priority_takes_effect() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.priority = 0;
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let update = CredentialUpdate {
+            priority: Some(5),
+            ..Default::default()
+        };
+        manager.update_credential(1, update).unwrap();
+
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.credentials.priority, 5);
     }
 }

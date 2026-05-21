@@ -6,6 +6,7 @@ import {
   Wallet,
   KeyRound,
   PlayCircle,
+  Pencil,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -37,6 +38,7 @@ import { cn } from '@/lib/utils'
 interface CredentialRowProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
+  onEdit: (cred: CredentialStatusItem) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
@@ -75,6 +77,7 @@ function authMethodLabel(method?: string): string {
 export function CredentialRow({
   credential,
   onViewBalance,
+  onEdit,
   selected,
   onToggleSelect,
   balance,
@@ -387,6 +390,15 @@ export function CredentialRow({
               title="查看余额详情"
             >
               <Wallet className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 w-7 p-0"
+              onClick={() => onEdit(credential)}
+              title="编辑凭据"
+            >
+              <Pencil className="h-3.5 w-3.5" />
             </Button>
             <Button
               size="sm"

@@ -82,6 +82,32 @@ pub struct VerifyMessageRequest {
     pub model: String,
 }
 
+/// 部分更新凭据请求（PATCH /credentials/:id）
+///
+/// 所有字段都是 Optional：`None` 表示该字段不修改；`Some("")` 表示把字段清空（重置为 None）。
+/// authMethod 不可改——切换鉴权方式实际上等于换一个凭据，应该删除后重新添加。
+/// id / accessToken / expiresAt / subscriptionTitle 由系统维护，也不可改。
+/// disabled 有专用端点（POST /:id/disabled），不在此处覆盖。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialRequest {
+    pub refresh_token: Option<String>,
+    pub kiro_api_key: Option<String>,
+    pub profile_arn: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub region: Option<String>,
+    pub auth_region: Option<String>,
+    pub api_region: Option<String>,
+    pub machine_id: Option<String>,
+    pub email: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+    pub endpoint: Option<String>,
+    pub priority: Option<u32>,
+}
+
 /// 修改优先级请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

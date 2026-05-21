@@ -16,7 +16,7 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, verifyCredentialMessage } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
@@ -26,6 +26,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [editTarget, setEditTarget] = useState<CredentialStatusItem | null>(null)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -702,7 +703,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
               </Button>
-              <Button onClick={() => setAddDialogOpen(true)} size="sm">
+              <Button onClick={() => { setEditTarget(null); setAddDialogOpen(true) }} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
               </Button>
@@ -743,6 +744,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                         key={credential.id}
                         credential={credential}
                         onViewBalance={handleViewBalance}
+                        onEdit={(cred) => {
+                          setEditTarget(cred)
+                          setAddDialogOpen(true)
+                        }}
                         selected={selectedIds.has(credential.id)}
                         onToggleSelect={() => toggleSelect(credential.id)}
                         balance={balanceMap.get(credential.id) || null}
@@ -789,10 +794,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setBalanceDialogOpen}
       />
 
-      {/* 添加凭据对话框 */}
+      {/* 添加 / 编辑凭据对话框（复用一个组件） */}
       <AddCredentialDialog
         open={addDialogOpen}
-        onOpenChange={setAddDialogOpen}
+        onOpenChange={(open) => {
+          setAddDialogOpen(open)
+          if (!open) setEditTarget(null)
+        }}
+        mode={editTarget ? 'edit' : 'add'}
+        editTarget={editTarget}
       />
 
       {/* 批量导入对话框 */}
