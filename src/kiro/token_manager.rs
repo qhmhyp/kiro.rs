@@ -827,10 +827,10 @@ impl MultiTokenManager {
                     if self.self_heal_too_many_failures() {
                         match self.acquire_credential(model) {
                             Some(x) => x,
-                            None => anyhow::bail!("所有凭据均已禁用（0/{}）", total),
+                            None => anyhow::bail!("所有凭据均不可用（已禁用或冷却中，0/{}）", total),
                         }
                     } else {
-                        anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                        anyhow::bail!("所有凭据均不可用（已禁用或冷却中，0/{}）", total);
                     }
                 }
             };
@@ -852,7 +852,7 @@ impl MultiTokenManager {
                         };
                     attempt_count += 1;
                     if !has_available {
-                        anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                        anyhow::bail!("所有凭据均不可用（已禁用或冷却中，0/{}）", total);
                     }
                 }
             }
@@ -1186,7 +1186,7 @@ impl MultiTokenManager {
                 just_disabled = true;
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
                 if !any_entry_available(&entries) {
-                    tracing::error!("所有凭据均已禁用！");
+                    tracing::error!("所有凭据均不可用（已禁用或冷却中）！");
                 }
             }
 
@@ -1233,7 +1233,7 @@ impl MultiTokenManager {
 
             let has_available = any_entry_available(&entries);
             if !has_available {
-                tracing::error!("所有凭据均已禁用！");
+                tracing::error!("所有凭据均不可用（已禁用或冷却中）！");
             }
             (has_available, true)
         };
@@ -1322,7 +1322,7 @@ impl MultiTokenManager {
 
                 let has_available = any_entry_available(&entries);
                 if !has_available {
-                    tracing::error!("所有凭据均已禁用！");
+                    tracing::error!("所有凭据均不可用（已禁用或冷却中）！");
                 }
                 (has_available, true)
             }
@@ -1363,7 +1363,7 @@ impl MultiTokenManager {
 
             let has_available = any_entry_available(&entries);
             if !has_available {
-                tracing::error!("所有凭据均已禁用！");
+                tracing::error!("所有凭据均不可用（已禁用或冷却中）！");
             }
             (has_available, true)
         };
@@ -2333,7 +2333,7 @@ mod tests {
 
         let err = manager.acquire_context(None).await.err().unwrap().to_string();
         assert!(
-            err.contains("所有凭据均已禁用"),
+            err.contains("所有凭据"),
             "错误应提示所有凭据禁用，实际: {}",
             err
         );
@@ -2373,7 +2373,7 @@ mod tests {
 
         let err = manager.acquire_context(None).await.err().unwrap().to_string();
         assert!(
-            err.contains("所有凭据均已禁用"),
+            err.contains("所有凭据"),
             "错误应提示所有凭据禁用，实际: {}",
             err
         );
