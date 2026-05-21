@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  RefreshCw,
   Trash2,
   Loader2,
   Wallet,
@@ -29,7 +28,6 @@ import type {
 import {
   useSetDisabled,
   useSetPriority,
-  useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
@@ -91,7 +89,6 @@ export function CredentialRow({
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
-  const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
 
@@ -361,21 +358,6 @@ export function CredentialRow({
         {/* 其它操作 */}
         <td className="px-2 py-2">
           <div className="flex items-center gap-1">
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-7 w-7 p-0"
-              onClick={() =>
-                resetFailure.mutate(credential.id, {
-                  onSuccess: (res) => toast.success(res.message),
-                  onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-                })
-              }
-              disabled={resetFailure.isPending}
-              title="重置失败计数并尝试启用（对 Manual / InvalidConfig 禁用无效）"
-            >
-              <RefreshCw className={cn('h-3.5 w-3.5', resetFailure.isPending && 'animate-spin')} />
-            </Button>
             <Button
               size="sm"
               variant="ghost"
