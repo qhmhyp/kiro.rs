@@ -3,9 +3,9 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
-  resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  resetCredentialFailure,
   addCredential,
   deleteCredential,
   updateCredential,
@@ -55,7 +55,7 @@ export function useSetPriority() {
   })
 }
 
-// 重置失败计数
+// 重置失败计数（dashboard 批量按钮使用）
 export function useResetFailure() {
   const queryClient = useQueryClient()
   return useMutation({

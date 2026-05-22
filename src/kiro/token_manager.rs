@@ -866,6 +866,9 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // 记录"最近错误"供 admin UI 状态徽章展示
+                    // （Token 刷新无 HTTP status，传 None 表示内部错误）
+                    self.set_last_error(id, None, &e.to_string());
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
@@ -1634,6 +1637,8 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            // 重置状态时一并清掉最近错误，状态徽章回归"正常"
+            entry.last_error = None;
         }
         // 持久化更改
         self.persist_credentials()?;

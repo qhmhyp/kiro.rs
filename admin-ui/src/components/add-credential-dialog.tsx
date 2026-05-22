@@ -102,14 +102,9 @@ export function AddCredentialDialog({
           ? parseInt(form.priority)
           : undefined,
       }
-      // 过滤掉 undefined 字段，避免序列化时出现 explicit null
-      Object.keys(payload).forEach(k => {
-        if ((payload as Record<string, unknown>)[k] === undefined) {
-          delete (payload as Record<string, unknown>)[k]
-        }
-      })
-
-      if (Object.keys(payload).length === 0) {
+      // JSON.stringify 会自动跳过 undefined，不需要显式删除
+      const hasAnyChange = Object.values(payload).some(v => v !== undefined)
+      if (!hasAnyChange) {
         toast.info('没有需要修改的字段')
         return
       }
