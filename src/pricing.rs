@@ -60,7 +60,7 @@ impl PricingTable {
         let mut table = HashMap::new();
         table.insert("claude-opus-4".to_string(), opus);
         table.insert("claude-sonnet-4".to_string(), sonnet);
-        table.insert("claude-haiku-4-5".to_string(), haiku);
+        table.insert("claude-haiku-4".to_string(), haiku);
         // 未知模型兜底取 sonnet 档（避免低估）
         Self { table, fallback: sonnet }
     }
@@ -186,5 +186,16 @@ mod tests {
     fn test_negative_tokens_clamped() {
         let t = PricingTable::builtin();
         assert_eq!(t.cost_usd("claude-sonnet-4-6", -5, -5, -5, -5), 0.0);
+    }
+
+    #[test]
+    fn test_haiku_cost_resolves() {
+        let t = PricingTable::builtin();
+        // haiku: input 1/M → 1M input = $1 (NOT sonnet's $3)
+        let cost = t.cost_usd("claude-haiku-4-5", 1_000_000, 0, 0, 0);
+        assert!((cost - 1.0).abs() < 1e-6, "got {cost}");
+        // 带日期后缀的完整 id 也应命中 haiku 档
+        let cost2 = t.cost_usd("claude-haiku-4-5-20251001", 1_000_000, 0, 0, 0);
+        assert!((cost2 - 1.0).abs() < 1e-6, "got {cost2}");
     }
 }
