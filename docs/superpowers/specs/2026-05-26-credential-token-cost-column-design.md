@@ -57,9 +57,11 @@ impl PricingTable {
 
 | model key | input | output | cache_read | cache_creation |
 |---|---|---|---|---|
-| `claude-opus-4` | 15/M | 75/M | 1.5/M | 18.75/M |
+| `claude-opus-4` | 5/M | 25/M | 0.5/M | 6.25/M |
 | `claude-sonnet-4` | 3/M | 15/M | 0.3/M | 3.75/M |
-| `claude-haiku-4-5` | 1/M | 5/M | 0.1/M | 1.25/M |
+| `claude-haiku-4` | 1/M | 5/M | 0.1/M | 1.25/M |
+
+（Opus 取 4.5+ 挂牌价 $5/$25；如需对老版 Opus 4.0/4.1 精确计价，用 config 覆盖。）
 
 **model 归一化规则**（`price_for` 内部）：
 1. 去掉 `-thinking` 后缀（thinking 不改变 token 计价）。

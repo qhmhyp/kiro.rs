@@ -230,10 +230,10 @@ docker-compose up
 {
   "pricing": {
     "claude-opus-4-7": {
-      "input": 0.000015,
-      "output": 0.000075,
-      "cacheRead": 0.0000015,
-      "cacheCreation": 0.00001875
+      "input": 0.000005,
+      "output": 0.000025,
+      "cacheRead": 0.0000005,
+      "cacheCreation": 0.00000625
     }
   }
 }

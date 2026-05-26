@@ -39,11 +39,12 @@ const PER_M: f64 = 1e6;
 impl PricingTable {
     /// 内置默认表（Anthropic Claude 4 系列挂牌价，USD/M token）
     pub fn builtin() -> Self {
+        // Opus 4.5+ 挂牌价（$5/$25 per M）；cache_read=0.1×input，cache_creation=1.25×input
         let opus = ModelPrice {
-            input_cost_per_token: 15.0 / PER_M,
-            output_cost_per_token: 75.0 / PER_M,
-            cache_read_input_token_cost: 1.5 / PER_M,
-            cache_creation_input_token_cost: 18.75 / PER_M,
+            input_cost_per_token: 5.0 / PER_M,
+            output_cost_per_token: 25.0 / PER_M,
+            cache_read_input_token_cost: 0.5 / PER_M,
+            cache_creation_input_token_cost: 6.25 / PER_M,
         };
         let sonnet = ModelPrice {
             input_cost_per_token: 3.0 / PER_M,
@@ -132,11 +133,11 @@ mod tests {
     #[test]
     fn test_builtin_opus_cost_with_cache_multipliers() {
         let t = PricingTable::builtin();
-        // opus: input 15/M, output 75/M, cache_read 1.5/M, cache_creation 18.75/M
+        // opus: input 5/M, output 25/M, cache_read 0.5/M, cache_creation 6.25/M
         // 1M input + 1M output + 1M cache_read + 1M cache_creation
         let cost = t.cost_usd("claude-opus-4-7", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
-        // 15 + 75 + 1.5 + 18.75 = 110.25
-        assert!((cost - 110.25).abs() < 1e-6, "got {cost}");
+        // 5 + 25 + 0.5 + 6.25 = 36.75
+        assert!((cost - 36.75).abs() < 1e-6, "got {cost}");
     }
 
     #[test]
@@ -173,10 +174,10 @@ mod tests {
         assert!((cost - 1.0).abs() < 1e-9, "got {cost}"); // 1000 * 0.001
         // 未覆盖的 opus-4-6 仍走内置前缀价
         assert_eq!(t.price_for("claude-opus-4-6"), &ModelPrice {
-            input_cost_per_token: 15.0 / 1e6,
-            output_cost_per_token: 75.0 / 1e6,
-            cache_read_input_token_cost: 1.5 / 1e6,
-            cache_creation_input_token_cost: 18.75 / 1e6,
+            input_cost_per_token: 5.0 / 1e6,
+            output_cost_per_token: 25.0 / 1e6,
+            cache_read_input_token_cost: 0.5 / 1e6,
+            cache_creation_input_token_cost: 6.25 / 1e6,
         });
     }
 
