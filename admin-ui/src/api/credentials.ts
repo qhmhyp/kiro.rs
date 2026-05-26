@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  UpdateCredentialRequest,
+  VerifyMessageResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -93,14 +95,24 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data
 }
 
-// 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
+// 用一次最小 messages 请求验证凭据 + 模型是否可用
+export async function verifyCredentialMessage(
+  id: number,
+  model: string
+): Promise<VerifyMessageResponse> {
+  const { data } = await api.post<VerifyMessageResponse>(
+    `/credentials/${id}/verify-message`,
+    { model }
+  )
   return data
 }
 
-// 设置负载均衡模式
-export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+// 部分更新凭据字段
+export async function updateCredential(
+  id: number,
+  payload: UpdateCredentialRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.patch<SuccessResponse>(`/credentials/${id}`, payload)
   return data
 }
+

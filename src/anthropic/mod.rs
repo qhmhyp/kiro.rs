@@ -22,9 +22,12 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-mod converter;
+#[cfg(test)]
+mod cache_scenarios;
+pub(crate) mod converter;
 mod handlers;
 mod middleware;
+mod prefix_cache;
 mod router;
 mod stream;
 pub mod types;

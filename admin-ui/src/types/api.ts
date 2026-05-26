@@ -87,3 +87,31 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// 凭据消息验证响应（POST /credentials/:id/verify-message）
+export interface VerifyMessageResponse {
+  ok: boolean
+  status?: number | null
+  latencyMs: number
+  error?: string | null
+}
+
+// 凭据部分更新请求（PATCH /credentials/:id）
+// 字段语义：undefined = 不修改；"" = 清空；其他 = 设为新值
+export interface UpdateCredentialRequest {
+  refreshToken?: string
+  kiroApiKey?: string
+  profileArn?: string
+  clientId?: string
+  clientSecret?: string
+  region?: string
+  authRegion?: string
+  apiRegion?: string
+  machineId?: string
+  email?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  endpoint?: string
+  priority?: number
+}

@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDisabledRequest, SetPriorityRequest, SuccessResponse,
+        UpdateCredentialRequest, VerifyMessageRequest,
     },
 };
 
@@ -122,21 +122,33 @@ pub async fn force_refresh_token(
     }
 }
 
-/// GET /api/admin/config/load-balancing
-/// 获取负载均衡模式
-pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_load_balancing_mode();
-    Json(response)
-}
-
-/// PUT /api/admin/config/load-balancing
-/// 设置负载均衡模式
-pub async fn set_load_balancing_mode(
+/// PATCH /api/admin/credentials/:id
+/// 部分更新凭据字段（authMethod / disabled 等不在此处覆盖）
+pub async fn update_credential(
     State(state): State<AdminState>,
-    Json(payload): Json<SetLoadBalancingModeRequest>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateCredentialRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_load_balancing_mode(payload) {
-        Ok(response) => Json(response).into_response(),
+    match state.service.update_credential(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+
+/// POST /api/admin/credentials/:id/verify-message
+/// 用指定凭据 + 模型发起一次最小 messages 请求，返回 status / latency / 错误信息
+pub async fn verify_credential_message(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<VerifyMessageRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .verify_credential_message(id, &payload.model)
+        .await
+    {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+

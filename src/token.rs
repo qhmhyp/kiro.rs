@@ -224,6 +224,44 @@ fn count_all_tokens_local(
     total.max(1)
 }
 
+/// 计算单条消息（最后一轮 user）的 token 数
+///
+/// 复用 `count_tokens` 的字符权重 + 短文本放大系数，专门用于"当前轮"的开销估算，
+/// 区别于 `count_all_tokens_local` 那样把整个 messages/system/tools 都算上。
+pub(crate) fn count_message_tokens(content: &serde_json::Value) -> u64 {
+    let mut total = 0u64;
+    match content {
+        serde_json::Value::String(s) => {
+            total += count_tokens(s);
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    total += count_tokens(text);
+                }
+                // tool_result content 也可能携带文本
+                if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                    if let Some(c) = item.get("content") {
+                        match c {
+                            serde_json::Value::String(s) => total += count_tokens(s),
+                            serde_json::Value::Array(inner) => {
+                                for sub in inner {
+                                    if let Some(t) = sub.get("text").and_then(|v| v.as_str()) {
+                                        total += count_tokens(t);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    total
+}
+
 /// 估算输出 tokens
 pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     let mut total = 0;

@@ -36,3 +36,4 @@ parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
+moka = { version = "0.12", features = ["sync"] }  # 高性能内存缓存（用于会话级 usage 缓存模拟）

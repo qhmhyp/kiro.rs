@@ -9,12 +9,13 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::provider::{KiroProvider, VerifyOutcome};
+use crate::kiro::token_manager::{CredentialUpdate, MultiTokenManager};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, UpdateCredentialRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -34,6 +35,7 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    kiro_provider: Arc<KiroProvider>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -43,6 +45,7 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
+        kiro_provider: Arc<KiroProvider>,
         known_endpoints: impl IntoIterator<Item = String>,
     ) -> Self {
         let cache_path = token_manager
@@ -53,6 +56,7 @@ impl AdminService {
 
         Self {
             token_manager,
+            kiro_provider,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
@@ -102,19 +106,12 @@ impl AdminService {
     }
 
     /// 设置凭据禁用状态
+    ///
+    /// 禁用后无需手动切换：下一次 `acquire_credential` 自动按优先级分组 + 组内 LRU 选择
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
-        // 先获取当前凭据 ID，用于判断是否需要切换
-        let snapshot = self.token_manager.snapshot();
-        let current_id = snapshot.current_id;
-
         self.token_manager
             .set_disabled(id, disabled)
             .map_err(|e| self.classify_error(e, id))?;
-
-        // 只有禁用的是当前凭据时才尝试切换到下一个
-        if disabled && id == current_id {
-            let _ = self.token_manager.switch_to_next();
-        }
         Ok(())
     }
 
@@ -273,32 +270,6 @@ impl AdminService {
         Ok(())
     }
 
-    /// 获取负载均衡模式
-    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
-        LoadBalancingModeResponse {
-            mode: self.token_manager.get_load_balancing_mode(),
-        }
-    }
-
-    /// 设置负载均衡模式
-    pub fn set_load_balancing_mode(
-        &self,
-        req: SetLoadBalancingModeRequest,
-    ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
-            return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
-            ));
-        }
-
-        self.token_manager
-            .set_load_balancing_mode(req.mode.clone())
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        Ok(LoadBalancingModeResponse { mode: req.mode })
-    }
-
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -453,5 +424,97 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+
+    /// 部分更新凭据（PATCH /credentials/:id）
+    ///
+    /// 校验 endpoint 是否在已知列表中，然后转发到 token_manager。
+    pub fn update_credential(
+        &self,
+        id: u64,
+        req: UpdateCredentialRequest,
+    ) -> Result<(), AdminServiceError> {
+        // endpoint 校验：Some(非空字符串) 时必须是已知端点
+        if let Some(endpoint) = &req.endpoint {
+            if !endpoint.is_empty() && !self.known_endpoints.contains(endpoint) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点: {}",
+                    endpoint
+                )));
+            }
+        }
+
+        let update = CredentialUpdate {
+            refresh_token: req.refresh_token,
+            kiro_api_key: req.kiro_api_key,
+            profile_arn: req.profile_arn,
+            client_id: req.client_id,
+            client_secret: req.client_secret,
+            region: req.region,
+            auth_region: req.auth_region,
+            api_region: req.api_region,
+            machine_id: req.machine_id,
+            email: req.email,
+            proxy_url: req.proxy_url,
+            proxy_username: req.proxy_username,
+            proxy_password: req.proxy_password,
+            endpoint: req.endpoint,
+            priority: req.priority,
+        };
+
+        self.token_manager
+            .update_credential(id, update)
+            .map_err(|e| Self::token_manager_error_to_admin(id, e))
+    }
+
+    fn token_manager_error_to_admin(id: u64, err: anyhow::Error) -> AdminServiceError {
+        let msg = err.to_string();
+        if msg.contains("不存在") {
+            AdminServiceError::NotFound { id }
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
+    }
+
+    /// 用指定凭据 + 指定模型发起一次最小 messages 请求，验证凭据有效性。
+    ///
+    /// 即使凭据处于 disabled / cooldown 状态也会绕过调度强制使用该凭据。
+    /// 返回结构化的 VerifyOutcome（status / latency_ms / error）。
+    pub async fn verify_credential_message(
+        &self,
+        id: u64,
+        model: &str,
+    ) -> Result<VerifyOutcome, AdminServiceError> {
+        use crate::anthropic::converter::convert_request;
+        use crate::anthropic::types::MessagesRequest;
+        use crate::kiro::model::requests::kiro::KiroRequest;
+
+        // 先校验 id 是否存在（避免后续构造请求失败时误判为"模型错误"）
+        if !self.token_manager.snapshot().entries.iter().any(|e| e.id == id) {
+            return Err(AdminServiceError::NotFound { id });
+        }
+
+        // 构造最小 messages 请求体（MessagesRequest 只 derive Deserialize，所以从 JSON 反序列化）
+        let request_json = serde_json::json!({
+            "model": model,
+            "max_tokens": 8,
+            "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let request: MessagesRequest = serde_json::from_value(request_json)
+            .map_err(|e| AdminServiceError::InternalError(format!("构造测试请求失败: {}", e)))?;
+
+        let conversion = convert_request(&request)
+            .map_err(|e| AdminServiceError::InvalidCredential(format!("模型不受支持或请求无效: {:?}", e)))?;
+
+        let kiro_request = KiroRequest {
+            conversation_state: conversion.conversation_state,
+            profile_arn: None,
+        };
+
+        let body = serde_json::to_string(&kiro_request)
+            .map_err(|e| AdminServiceError::InternalError(format!("序列化失败: {}", e)))?;
+
+        Ok(self.kiro_provider.send_once_with_credential(id, &body).await)
     }
 }

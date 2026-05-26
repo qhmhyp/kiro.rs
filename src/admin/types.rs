@@ -74,6 +74,40 @@ pub struct SetDisabledRequest {
     pub disabled: bool,
 }
 
+/// 验证凭据请求（用一次最小 messages 调用测试凭据 + 模型有效性）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyMessageRequest {
+    /// 测试用模型 ID，如 "claude-haiku-4-5"
+    pub model: String,
+}
+
+/// 部分更新凭据请求（PATCH /credentials/:id）
+///
+/// 所有字段都是 Optional：`None` 表示该字段不修改；`Some("")` 表示把字段清空（重置为 None）。
+/// authMethod 不可改——切换鉴权方式实际上等于换一个凭据，应该删除后重新添加。
+/// id / accessToken / expiresAt / subscriptionTitle 由系统维护，也不可改。
+/// disabled 有专用端点（POST /:id/disabled），不在此处覆盖。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialRequest {
+    pub refresh_token: Option<String>,
+    pub kiro_api_key: Option<String>,
+    pub profile_arn: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub region: Option<String>,
+    pub auth_region: Option<String>,
+    pub api_region: Option<String>,
+    pub machine_id: Option<String>,
+    pub email: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+    pub endpoint: Option<String>,
+    pub priority: Option<u32>,
+}
+
 /// 修改优先级请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -176,24 +210,6 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
-}
-
-// ============ 负载均衡配置 ============
-
-/// 负载均衡模式响应
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
-    pub mode: String,
-}
-
-/// 设置负载均衡模式请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
-    pub mode: String,
 }
 
 // ============ 通用响应 ============

@@ -8,8 +8,8 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        get_credential_balance, reset_failure_count, set_credential_disabled,
+        set_credential_priority, update_credential, verify_credential_message,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -25,8 +25,8 @@ use super::{
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
-/// - `GET /config/load-balancing` - 获取负载均衡模式
-/// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `POST /credentials/:id/verify-message` - 用指定模型发一次最小 messages 请求验证凭据
+/// - `PATCH /credentials/:id` - 部分更新凭据字段（refresh_token / proxy / endpoint 等）
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -38,15 +38,18 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
-        .route("/credentials/{id}", delete(delete_credential))
+        .route(
+            "/credentials/{id}",
+            delete(delete_credential).patch(update_credential),
+        )
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route(
-            "/config/load-balancing",
-            get(get_load_balancing_mode).put(set_load_balancing_mode),
+            "/credentials/{id}/verify-message",
+            post(verify_credential_message),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

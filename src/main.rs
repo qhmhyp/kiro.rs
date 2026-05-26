@@ -141,12 +141,12 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
-    let kiro_provider = KiroProvider::with_proxy(
+    let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
-    );
+    ));
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -160,7 +160,7 @@ async fn main() {
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
-        Some(kiro_provider),
+        Some(kiro_provider.clone()),
         config.extract_thinking,
     );
 
@@ -178,7 +178,7 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(token_manager.clone(), kiro_provider.clone(), endpoint_names.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

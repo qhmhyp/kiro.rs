@@ -3,10 +3,12 @@
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::json;
 use uuid::Uuid;
 
+use super::prefix_cache::ConvoTokenCache;
 use crate::kiro::model::events::Event;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -454,9 +456,14 @@ impl SseStateManager {
     }
 
     /// 生成最终事件序列
+    ///
+    /// `cache_read` / `cache_creation` 是从 conv-level 缓存中拆出来的"模拟" prompt cache 计费量，
+    /// 调用方应保证 `input_tokens + cache_read + cache_creation` 等于真实总输入。
     pub fn generate_final_events(
         &mut self,
         input_tokens: i32,
+        cache_creation: i32,
+        cache_read: i32,
         output_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -488,6 +495,8 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
+                        "cache_creation_input_tokens": cache_creation,
+                        "cache_read_input_tokens": cache_read,
                         "output_tokens": output_tokens
                     }
                 }),
@@ -508,6 +517,18 @@ impl SseStateManager {
 }
 
 use super::converter::get_context_window_size;
+
+/// usage 缓存上下文
+///
+/// 让 StreamContext 能在生成 SSE 事件时把 input_tokens 拆成
+/// `cache_read_input_tokens` / `cache_creation_input_tokens` / `input_tokens` 三段。
+/// 该缓存**不影响真实上游调用**，只是让返回的 usage 字段看起来像启用了 prompt cache。
+pub struct UsageCacheCtx {
+    pub cache: Arc<ConvoTokenCache>,
+    pub conversation_id: String,
+    /// 当前轮（最后一条 user 消息）的 token 估算
+    pub current_turn_tokens: i32,
+}
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -542,6 +563,12 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 可选的 usage 缓存上下文（注入后 message_start/message_delta 会带 cache_* 字段）
+    pub usage_cache: Option<UsageCacheCtx>,
+    /// 在 generate_final_events 里计算并缓存的最终 (cache_read, cache_creation, input) 三元组
+    /// 供 BufferedStreamContext 在 commit 之后回填 message_start 时复用，避免再次 peek
+    /// 读到 post-commit 的污染状态
+    pub final_usage_split: Option<(i32, i32, i32)>,
 }
 
 impl StreamContext {
@@ -568,11 +595,43 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            usage_cache: None,
+            final_usage_split: None,
+        }
+    }
+
+    /// 注入 usage 缓存上下文（构建器方法）
+    pub fn with_usage_cache(
+        mut self,
+        cache: Arc<ConvoTokenCache>,
+        conversation_id: String,
+        current_turn_tokens: i32,
+    ) -> Self {
+        self.usage_cache = Some(UsageCacheCtx {
+            cache,
+            conversation_id,
+            current_turn_tokens,
+        });
+        self
+    }
+
+    /// 基于 total_input_tokens 拆分 cache 三元组（不写入缓存）
+    /// 没有注入 usage_cache 时返回 (0, 0, total_input_tokens)
+    fn peek_usage_split(&self, total_input_tokens: i32) -> (i32, i32, i32) {
+        match &self.usage_cache {
+            Some(ctx) => ctx.cache.peek(
+                &ctx.conversation_id,
+                total_input_tokens,
+                ctx.current_turn_tokens,
+            ),
+            None => (0, 0, total_input_tokens),
         }
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let (cache_read, cache_creation, input_tokens_split) =
+            self.peek_usage_split(self.input_tokens);
         json!({
             "type": "message_start",
             "message": {
@@ -584,7 +643,9 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens_split,
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_read_input_tokens": cache_read,
                     "output_tokens": 1
                 }
             }
@@ -1120,11 +1181,23 @@ impl StreamContext {
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
+        // 拆分 usage 三段并提交本轮 history 大小给下一轮使用
+        let (cache_read, cache_creation, input_tokens_split) =
+            self.peek_usage_split(final_input_tokens);
+        // 把 commit 之前的拆分结果缓存起来，BufferedStreamContext 回填 message_start 时直接复用
+        self.final_usage_split = Some((cache_read, cache_creation, input_tokens_split));
+        if let Some(ctx) = &self.usage_cache {
+            ctx.cache
+                .commit(&ctx.conversation_id, final_input_tokens, ctx.current_turn_tokens);
+        }
+
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
-        );
+        events.extend(self.state_manager.generate_final_events(
+            input_tokens_split,
+            cache_creation,
+            cache_read,
+            self.output_tokens,
+        ));
         events
     }
 }
@@ -1168,6 +1241,19 @@ impl BufferedStreamContext {
         }
     }
 
+    /// 注入 usage 缓存上下文（透传到内部 StreamContext）
+    pub fn with_usage_cache(
+        mut self,
+        cache: Arc<ConvoTokenCache>,
+        conversation_id: String,
+        current_turn_tokens: i32,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_usage_cache(cache, conversation_id, current_turn_tokens);
+        self
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1187,8 +1273,8 @@ impl BufferedStreamContext {
     /// 完成流处理并返回所有事件
     ///
     /// 此方法会：
-    /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
+    /// 1. 生成最终事件（message_delta, message_stop）—— 使用真实 total 拆分 cache 三段
+    /// 2. 用正确的 input_tokens / cache_* 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
         // 如果从未处理过事件，也要生成初始事件
@@ -1198,7 +1284,7 @@ impl BufferedStreamContext {
             self.initial_events_generated = true;
         }
 
-        // 生成最终事件
+        // 生成最终事件（这一步内部已经用真实 total 拆分并 commit 缓存）
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
@@ -1208,12 +1294,22 @@ impl BufferedStreamContext {
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
 
-        // 更正 message_start 事件中的 input_tokens
+        // generate_final_events 已经把 commit 之前的拆分结果缓存到 inner.final_usage_split，
+        // 直接复用即可（避免再次 peek 读到 post-commit 状态）
+        let (cache_read, cache_creation, input_tokens_split) = self
+            .inner
+            .final_usage_split
+            .unwrap_or((0, 0, final_input_tokens));
+
+        // 更正 message_start 事件中的 usage 字段
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(input_tokens_split);
+                        usage["cache_creation_input_tokens"] =
+                            serde_json::json!(cache_creation);
+                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                     }
                 }
             }
