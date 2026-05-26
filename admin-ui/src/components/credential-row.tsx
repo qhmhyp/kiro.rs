@@ -403,6 +403,22 @@ export function CredentialRow({
           </div>
         </td>
 
+        {/* 消耗金额 */}
+        <td className="px-2 py-2 text-sm whitespace-nowrap">
+          <span
+            className="text-xs font-medium tabular-nums cursor-help"
+            title={[
+              `输入: ${credential.inputTokensTotal.toLocaleString()} tok`,
+              `输出: ${credential.outputTokensTotal.toLocaleString()} tok`,
+              `cache 读: ${credential.cacheReadTokensTotal.toLocaleString()} tok`,
+              `cache 写: ${credential.cacheCreationTokensTotal.toLocaleString()} tok`,
+              '（按各模型当时单价累计）',
+            ].join('\n')}
+          >
+            ${credential.costUsd.toFixed(4)}
+          </span>
+        </td>
+
         {/* 最近使用 */}
         <td className="px-2 py-2 text-xs text-muted-foreground whitespace-nowrap">
           {formatLastUsed(credential.lastUsedAt)}

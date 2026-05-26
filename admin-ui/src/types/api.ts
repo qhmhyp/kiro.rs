@@ -30,6 +30,11 @@ export interface CredentialStatusItem {
   name?: string
   cooldownUntil?: string
   lastError?: RecentError
+  costUsd: number
+  inputTokensTotal: number
+  cacheReadTokensTotal: number
+  cacheCreationTokensTotal: number
+  outputTokensTotal: number
 }
 
 // 余额响应
