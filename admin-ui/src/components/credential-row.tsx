@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import {
   Trash2,
@@ -143,6 +143,21 @@ export function CredentialRow({
   const [verifyModel, setVerifyModel] = useState(VERIFY_MODELS[0].value)
   const [verifying, setVerifying] = useState(false)
   const [verifyResult, setVerifyResult] = useState<VerifyMessageResponse | null>(null)
+  // 秒级 tick 让冷却倒计时实时更新（数据刷新是 30s/次，光靠它倒数会"卡住"）
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    if (!credential.cooldownUntil) return
+    const until = new Date(credential.cooldownUntil).getTime()
+    if (until - Date.now() <= 0) return
+    const timer = setInterval(() => {
+      setTick(t => t + 1)
+      // 到期后停止 tick 避免空转
+      if (new Date(credential.cooldownUntil!).getTime() - Date.now() <= 0) {
+        clearInterval(timer)
+      }
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [credential.cooldownUntil])
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
