@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use crate::pricing::ModelPriceConfig;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -108,6 +109,12 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 可选的模型单价覆盖表（key=model id，覆盖/新增内置价格表条目）
+    /// 缺省时使用内置默认价。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<HashMap<String, ModelPriceConfig>>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -183,6 +190,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            pricing: None,
             config_path: None,
         }
     }

@@ -4,7 +4,7 @@
 //! 四档 USD/token 单价。cache 按 Anthropic 倍率（cache_read≈0.1×input，
 //! cache_creation≈1.25×input）。内置默认表 + config.json 可选覆盖。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// 单个模型的单价（USD / token）
@@ -17,7 +17,7 @@ pub struct ModelPrice {
 }
 
 /// config.json 中的单价覆盖项（camelCase）
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelPriceConfig {
     pub input: f64,
