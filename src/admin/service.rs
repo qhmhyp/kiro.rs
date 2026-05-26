@@ -91,6 +91,14 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                name: entry.name,
+                cooldown_until: entry.cooldown_until,
+                last_error: entry.last_error,
+                cost_usd: entry.cost_usd,
+                input_tokens_total: entry.input_tokens_total,
+                cache_read_tokens_total: entry.cache_read_tokens_total,
+                cache_creation_tokens_total: entry.cache_creation_tokens_total,
+                output_tokens_total: entry.output_tokens_total,
             })
             .collect();
 
@@ -225,6 +233,7 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
+            name: None, // 新建时无自定义名称，可通过 PATCH 设置
             subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
@@ -445,6 +454,7 @@ impl AdminService {
         }
 
         let update = CredentialUpdate {
+            name: req.name,
             refresh_token: req.refresh_token,
             kiro_api_key: req.kiro_api_key,
             profile_arn: req.profile_arn,

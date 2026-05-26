@@ -416,6 +416,30 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// 限流冷却到期时间。Some 且 > now 时该凭据暂时不可用；不持久化。
     cooldown_until: Option<DateTime<Utc>>,
+    /// 最近一次上游错误。成功请求会清空。用于 admin UI 展示"凭据当前状态"。不持久化。
+    last_error: Option<RecentError>,
+    /// 累计消耗金额（USD）
+    cost_usd: f64,
+    /// 累计输入 token
+    input_tokens_total: u64,
+    /// 累计 cache_read token
+    cache_read_tokens_total: u64,
+    /// 累计 cache_creation token
+    cache_creation_tokens_total: u64,
+    /// 累计输出 token
+    output_tokens_total: u64,
+}
+
+/// 凭据最近一次上游错误（用于状态展示）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentError {
+    /// 错误发生时间（RFC3339）
+    pub at: String,
+    /// 上游 HTTP 状态码；网络层错误时 None
+    pub status: Option<u16>,
+    /// 错误体摘要（按字符截断到 256）
+    pub body_preview: String,
 }
 
 /// 部分更新凭据的请求载荷（送给 [`MultiTokenManager::update_credential`]）
@@ -423,6 +447,7 @@ struct CredentialEntry {
 /// 字符串字段语义：`None` = 不修改；`Some("")` = 清空；`Some(value)` = 设为新值。
 #[derive(Debug, Default, Clone)]
 pub struct CredentialUpdate {
+    pub name: Option<String>,
     pub refresh_token: Option<String>,
     pub kiro_api_key: Option<String>,
     pub profile_arn: Option<String>,
@@ -462,6 +487,16 @@ enum DisabledReason {
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
+    #[serde(default)]
+    cost_usd: f64,
+    #[serde(default)]
+    input_tokens_total: u64,
+    #[serde(default)]
+    cache_read_tokens_total: u64,
+    #[serde(default)]
+    cache_creation_tokens_total: u64,
+    #[serde(default)]
+    output_tokens_total: u64,
 }
 
 // ============================================================================
@@ -511,6 +546,25 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 用户自定义名称（前端优先于 email 显示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 限流冷却到期时间（RFC3339）；当前时刻晚于此值前该凭据被排除调度
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    /// 最近一次上游错误（成功调用后清空）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<RecentError>,
+    /// 累计消耗金额（USD）
+    pub cost_usd: f64,
+    /// 累计输入 token
+    pub input_tokens_total: u64,
+    /// 累计 cache_read token
+    pub cache_read_tokens_total: u64,
+    /// 累计 cache_creation token
+    pub cache_creation_tokens_total: u64,
+    /// 累计输出 token
+    pub output_tokens_total: u64,
 }
 
 /// 凭据管理器状态快照
@@ -548,6 +602,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 模型单价表（内置默认 + config 覆盖），构造时装配一次
+    pricing: crate::pricing::PricingTable,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -633,6 +689,12 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     cooldown_until: None,
+                    last_error: None,
+                    cost_usd: 0.0,
+                    input_tokens_total: 0,
+                    cache_read_tokens_total: 0,
+                    cache_creation_tokens_total: 0,
+                    output_tokens_total: 0,
                 }
             })
             .collect();
@@ -679,6 +741,9 @@ impl MultiTokenManager {
             );
         }
 
+        let pricing = crate::pricing::PricingTable::builtin()
+            .with_overrides(config.pricing.as_ref());
+
         let manager = Self {
             config,
             proxy,
@@ -688,6 +753,7 @@ impl MultiTokenManager {
             is_multiple_format,
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            pricing,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -841,6 +907,9 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // 记录"最近错误"供 admin UI 状态徽章展示
+                    // （Token 刷新无 HTTP status，传 None 表示内部错误）
+                    self.set_last_error(id, None, &e.to_string());
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
@@ -1063,6 +1132,11 @@ impl MultiTokenManager {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
+                entry.cost_usd = s.cost_usd;
+                entry.input_tokens_total = s.input_tokens_total;
+                entry.cache_read_tokens_total = s.cache_read_tokens_total;
+                entry.cache_creation_tokens_total = s.cache_creation_tokens_total;
+                entry.output_tokens_total = s.output_tokens_total;
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1087,6 +1161,11 @@ impl MultiTokenManager {
                         StatsEntry {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
+                            cost_usd: e.cost_usd,
+                            input_tokens_total: e.input_tokens_total,
+                            cache_read_tokens_total: e.cache_read_tokens_total,
+                            cache_creation_tokens_total: e.cache_creation_tokens_total,
+                            output_tokens_total: e.output_tokens_total,
                         },
                     )
                 })
@@ -1137,6 +1216,8 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
+                // 成功一次后清空"最近错误"，状态徽章回归正常
+                entry.last_error = None;
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -1145,6 +1226,70 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 累计指定凭据的 token 消耗金额（USD）与 token 明细
+    ///
+    /// 在 anthropic 层算定最终 usage 后调用。金额按记录时刻生效的单价算定累加；
+    /// token 负值按 0 处理。与 [`Self::report_success`] 解耦：成功计数在 provider 层
+    /// 已记，本方法只负责金额/明细。
+    ///
+    /// # Arguments
+    /// * `id` - 凭据 ID
+    /// * `model` - 本次请求模型 ID
+    /// * `input` / `cache_read` / `cache_creation` / `output` - 本次 usage 四段 token
+    pub fn add_cost(
+        &self,
+        id: u64,
+        model: &str,
+        input: i32,
+        cache_read: i32,
+        cache_creation: i32,
+        output: i32,
+    ) {
+        let cost = self.pricing.cost_usd(
+            model,
+            input as i64,
+            cache_read as i64,
+            cache_creation as i64,
+            output as i64,
+        );
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.cost_usd += cost;
+                entry.input_tokens_total += input.max(0) as u64;
+                entry.cache_read_tokens_total += cache_read.max(0) as u64;
+                entry.cache_creation_tokens_total += cache_creation.max(0) as u64;
+                entry.output_tokens_total += output.max(0) as u64;
+                tracing::debug!(
+                    "凭据 #{} 记账 +${:.6}（model={}, in={}, cr={}, cc={}, out={}），累计 ${:.6}",
+                    id, cost, model, input, cache_read, cache_creation, output, entry.cost_usd
+                );
+            }
+        }
+        self.save_stats_debounced();
+    }
+
+    /// 记录指定凭据的最近一次上游错误（用于 admin UI 状态展示）
+    ///
+    /// 与 [`Self::report_failure`] / [`Self::report_rate_limited`] 等独立——
+    /// 那些方法负责"是否禁用 / 是否冷却"决策，本方法只更新展示用的"最近错误"快照。
+    /// Provider 在每次失败分支调一次，与 report_* 系列配合使用。
+    pub fn set_last_error(&self, id: u64, status: Option<u16>, body: &str) {
+        let preview: String = if body.chars().count() > 256 {
+            body.chars().take(256).collect::<String>() + "..."
+        } else {
+            body.to_string()
+        };
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.last_error = Some(RecentError {
+                at: Utc::now().to_rfc3339(),
+                status,
+                body_preview: preview,
+            });
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1452,6 +1597,14 @@ impl MultiTokenManager {
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    name: e.credentials.name.clone(),
+                    cooldown_until: e.cooldown_until.map(|t| t.to_rfc3339()),
+                    last_error: e.last_error.clone(),
+                    cost_usd: e.cost_usd,
+                    input_tokens_total: e.input_tokens_total,
+                    cache_read_tokens_total: e.cache_read_tokens_total,
+                    cache_creation_tokens_total: e.cache_creation_tokens_total,
+                    output_tokens_total: e.output_tokens_total,
                 })
                 .collect(),
             current_id,
@@ -1537,6 +1690,7 @@ impl MultiTokenManager {
                 apply(&mut c.kiro_api_key, &update.kiro_api_key);
                 invalidate_token = true;
             }
+            apply(&mut c.name, &update.name);
             apply(&mut c.profile_arn, &update.profile_arn);
             apply(&mut c.client_id, &update.client_id);
             apply(&mut c.client_secret, &update.client_secret);
@@ -1582,6 +1736,8 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            // 重置状态时一并清掉最近错误，状态徽章回归"正常"
+            entry.last_error = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1817,6 +1973,12 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 cooldown_until: None,
+                last_error: None,
+                cost_usd: 0.0,
+                input_tokens_total: 0,
+                cache_read_tokens_total: 0,
+                cache_creation_tokens_total: 0,
+                output_tokens_total: 0,
             });
         }
 
@@ -2241,6 +2403,48 @@ mod tests {
         assert_eq!(manager.available_count(), 1);
     }
 
+    #[test]
+    fn test_add_cost_accumulates() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // sonnet: input 3/M, output 15/M。1000 input + 1000 output
+        manager.add_cost(1, "claude-sonnet-4-6", 1000, 0, 0, 1000);
+        // 累计第二次
+        manager.add_cost(1, "claude-sonnet-4-6", 1000, 0, 0, 1000);
+
+        let snap = manager.snapshot();
+        let entry = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        // 每次 = 1000*3e-6 + 1000*15e-6 = 0.003 + 0.015 = 0.018；两次 = 0.036
+        assert!((entry.cost_usd - 0.036).abs() < 1e-9, "got {}", entry.cost_usd);
+        assert_eq!(entry.input_tokens_total, 2000);
+        assert_eq!(entry.output_tokens_total, 2000);
+    }
+
+    #[test]
+    fn test_add_cost_unknown_id_noop() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        manager.add_cost(999, "claude-sonnet-4-6", 1000, 0, 0, 1000); // 不存在的 id
+        let snap = manager.snapshot();
+        assert_eq!(snap.entries[0].cost_usd, 0.0);
+    }
+
+    #[test]
+    fn test_stats_entry_backward_compat_defaults() {
+        // 旧格式 kiro_stats.json（无金额/token 字段）应反序列化为默认 0，保证向后兼容
+        let json = r#"{"4":{"success_count":11,"last_used_at":"2026-05-15T05:25:33Z"}}"#;
+        let stats: std::collections::HashMap<String, StatsEntry> =
+            serde_json::from_str(json).unwrap();
+        let s = stats.get("4").unwrap();
+        assert_eq!(s.success_count, 11);
+        assert_eq!(s.cost_usd, 0.0);
+        assert_eq!(s.input_tokens_total, 0);
+        assert_eq!(s.output_tokens_total, 0);
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
@@ -2434,6 +2638,12 @@ mod tests {
                 success_count: 0,
                 last_used_at: None,
                 cooldown_until: None,
+                last_error: None,
+                cost_usd: 0.0,
+                input_tokens_total: 0,
+                cache_read_tokens_total: 0,
+                cache_creation_tokens_total: 0,
+                output_tokens_total: 0,
             });
         }
 

@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::prefix_cache::ConvoTokenCache;
 use crate::kiro::model::events::Event;
+use crate::kiro::token_manager::MultiTokenManager;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -530,6 +531,12 @@ pub struct UsageCacheCtx {
     pub current_turn_tokens: i32,
 }
 
+/// 金额记账 sink：流结束算定 usage 后把消耗金额累计到该凭据
+pub struct CostSink {
+    pub manager: Arc<MultiTokenManager>,
+    pub credential_id: u64,
+}
+
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -569,6 +576,10 @@ pub struct StreamContext {
     /// 供 BufferedStreamContext 在 commit 之后回填 message_start 时复用，避免再次 peek
     /// 读到 post-commit 的污染状态
     pub final_usage_split: Option<(i32, i32, i32)>,
+    /// 可选的金额记账 sink（注入后 generate_final_events 会记一次账）
+    pub cost_sink: Option<CostSink>,
+    /// 金额是否已记账（防止重复记账）
+    pub cost_recorded: bool,
 }
 
 impl StreamContext {
@@ -597,6 +608,8 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             usage_cache: None,
             final_usage_split: None,
+            cost_sink: None,
+            cost_recorded: false,
         }
     }
 
@@ -612,6 +625,12 @@ impl StreamContext {
             conversation_id,
             current_turn_tokens,
         });
+        self
+    }
+
+    /// 注入金额记账 sink（构建器方法）
+    pub fn with_cost_sink(mut self, manager: Arc<MultiTokenManager>, credential_id: u64) -> Self {
+        self.cost_sink = Some(CostSink { manager, credential_id });
         self
     }
 
@@ -1198,6 +1217,22 @@ impl StreamContext {
             cache_read,
             self.output_tokens,
         ));
+
+        // 记账：把本次 usage 折算金额累计到凭据（仅一次）
+        if !self.cost_recorded {
+            if let Some(sink) = &self.cost_sink {
+                sink.manager.add_cost(
+                    sink.credential_id,
+                    &self.model,
+                    input_tokens_split,
+                    cache_read,
+                    cache_creation,
+                    self.output_tokens,
+                );
+            }
+            self.cost_recorded = true;
+        }
+
         events
     }
 }
@@ -1251,6 +1286,12 @@ impl BufferedStreamContext {
         self.inner = self
             .inner
             .with_usage_cache(cache, conversation_id, current_turn_tokens);
+        self
+    }
+
+    /// 注入金额记账 sink（透传到内部 StreamContext）
+    pub fn with_cost_sink(mut self, manager: Arc<MultiTokenManager>, credential_id: u64) -> Self {
+        self.inner = self.inner.with_cost_sink(manager, credential_id);
         self
     }
 
@@ -2081,5 +2122,43 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+}
+
+#[cfg(test)]
+mod cost_recording_tests {
+    use super::*;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_stream_final_events_record_cost() {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false).unwrap(),
+        );
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            1000, // input_tokens
+            false,
+            std::collections::HashMap::new(),
+        )
+        .with_cost_sink(manager.clone(), 1);
+        ctx.output_tokens = 500;
+
+        // 无 usage_cache 时拆分 = (0, 0, 1000)
+        let _ = ctx.generate_final_events();
+
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        // sonnet: 1000 input * 3e-6 + 500 output * 15e-6 = 0.003 + 0.0075 = 0.0105
+        assert!((e.cost_usd - 0.0105).abs() < 1e-9, "got {}", e.cost_usd);
+
+        // 二次调用不应重复记账（cost_recorded 保护）
+        let _ = ctx.generate_final_events();
+        let snap2 = manager.snapshot();
+        let e2 = snap2.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!((e2.cost_usd - 0.0105).abs() < 1e-9, "double-counted: {}", e2.cost_usd);
     }
 }

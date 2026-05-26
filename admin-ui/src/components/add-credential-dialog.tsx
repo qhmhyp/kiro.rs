@@ -25,6 +25,7 @@ interface AddCredentialDialogProps {
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
 const initialFormState = () => ({
+  name: '',
   refreshToken: '',
   kiroApiKey: '',
   authMethod: 'social' as AuthMethod,
@@ -59,6 +60,7 @@ export function AddCredentialDialog({
     if (isEdit && editTarget) {
       setForm({
         ...initialFormState(),
+        name: editTarget.name ?? '',
         authMethod: (editTarget.authMethod as AuthMethod) || 'social',
         priority: String(editTarget.priority),
         endpoint: editTarget.endpoint ?? '',
@@ -84,6 +86,7 @@ export function AddCredentialDialog({
       const trim = (s: string) => s.trim()
       const opt = (s: string) => (trim(s) ? trim(s) : undefined)
       const payload: UpdateCredentialRequest = {
+        name: opt(form.name),
         refreshToken: opt(form.refreshToken),
         kiroApiKey: opt(form.kiroApiKey),
         clientId: opt(form.clientId),
@@ -99,14 +102,9 @@ export function AddCredentialDialog({
           ? parseInt(form.priority)
           : undefined,
       }
-      // 过滤掉 undefined 字段，避免序列化时出现 explicit null
-      Object.keys(payload).forEach(k => {
-        if ((payload as Record<string, unknown>)[k] === undefined) {
-          delete (payload as Record<string, unknown>)[k]
-        }
-      })
-
-      if (Object.keys(payload).length === 0) {
+      // JSON.stringify 会自动跳过 undefined，不需要显式删除
+      const hasAnyChange = Object.values(payload).some(v => v !== undefined)
+      if (!hasAnyChange) {
         toast.info('没有需要修改的字段')
         return
       }
@@ -188,6 +186,25 @@ export function AddCredentialDialog({
               <p className="text-xs text-muted-foreground -mt-2">
                 所有字段留空表示不修改；填入新值将覆盖。authMethod 不可改（请删除后重新添加）。
               </p>
+            )}
+
+            {/* 自定义名称 */}
+            {isEdit && (
+              <div className="space-y-2">
+                <label htmlFor="name" className="text-sm font-medium">
+                  名称
+                </label>
+                <Input
+                  id="name"
+                  placeholder="留空保持原值；用于在列表中替代 email 显示"
+                  value={form.name}
+                  onChange={(e) => set('name', e.target.value)}
+                  disabled={isPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  自定义凭据显示名，优先级高于 email
+                </p>
+              </div>
             )}
 
             {/* 认证方式 */}

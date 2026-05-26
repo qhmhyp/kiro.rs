@@ -181,6 +181,19 @@ impl KiroProvider {
         }
     }
 
+    /// 构造一个上游错误，同时把"最近错误"记录到 token_manager 供 admin UI 展示
+    ///
+    /// 参数顺序与 [`UpstreamError::new`] 一致，方便从调用点统一替换。
+    fn upstream_error_for(
+        &self,
+        status: Option<u16>,
+        body: &str,
+        credential_id: u64,
+    ) -> UpstreamError {
+        self.token_manager.set_last_error(credential_id, status, body);
+        UpstreamError::new(status, body, credential_id)
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
@@ -211,8 +224,13 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, u64)> {
         self.call_api_with_retry(request_body, false).await
+    }
+
+    /// 暴露底层 token manager（供 anthropic 层记账金额）
+    pub fn token_manager(&self) -> std::sync::Arc<MultiTokenManager> {
+        self.token_manager.clone()
     }
 
     /// 用指定凭据发送一次非流式 API 请求，**不重试、不切换凭据、不冷却**。
@@ -317,7 +335,7 @@ impl KiroProvider {
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, u64)> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -384,7 +402,7 @@ impl KiroProvider {
                         e
                     );
                     last_error =
-                        Some(UpstreamError::new(None, &e.to_string(), ctx.id).into_anyhow());
+                        Some(self.upstream_error_for(None, &e.to_string(), ctx.id).into_anyhow());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -407,18 +425,18 @@ impl KiroProvider {
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id)
+                    return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id)
                         .exhausted()
                         .into_anyhow());
                 }
                 last_error =
-                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                    Some(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
-                return Err(UpstreamError::new(Some(400), &body, ctx.id).into_anyhow());
+                return Err(self.upstream_error_for(Some(400), &body, ctx.id).into_anyhow());
             }
 
             // 401/403 凭据问题
@@ -436,12 +454,12 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id)
+                    return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id)
                         .exhausted()
                         .into_anyhow());
                 }
                 last_error =
-                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                    Some(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 continue;
             }
 
@@ -464,11 +482,11 @@ impl KiroProvider {
                 );
                 let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
                 if !has_available {
-                    return Err(UpstreamError::new(Some(429), &body, ctx.id)
+                    return Err(self.upstream_error_for(Some(429), &body, ctx.id)
                         .exhausted()
                         .into_anyhow());
                 }
-                last_error = Some(UpstreamError::new(Some(429), &body, ctx.id).into_anyhow());
+                last_error = Some(self.upstream_error_for(Some(429), &body, ctx.id).into_anyhow());
                 continue;
             }
 
@@ -482,7 +500,7 @@ impl KiroProvider {
                     body
                 );
                 last_error =
-                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                    Some(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -491,12 +509,12 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
-                return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
             }
 
             // 兜底
             last_error =
-                Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                Some(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -517,7 +535,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -579,7 +597,7 @@ impl KiroProvider {
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error =
-                        Some(UpstreamError::new(None, &e.to_string(), ctx.id).into_anyhow());
+                        Some(self.upstream_error_for(None, &e.to_string(), ctx.id).into_anyhow());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -592,7 +610,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok((response, ctx.id));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -610,19 +628,19 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id)
+                    return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id)
                         .exhausted()
                         .into_anyhow());
                 }
 
                 last_error =
-                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                    Some(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 continue;
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                return Err(UpstreamError::new(Some(400), &body, ctx.id).into_anyhow());
+                return Err(self.upstream_error_for(Some(400), &body, ctx.id).into_anyhow());
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -648,13 +666,13 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id)
+                    return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id)
                         .exhausted()
                         .into_anyhow());
                 }
 
                 last_error =
-                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                    Some(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 continue;
             }
 
@@ -679,11 +697,11 @@ impl KiroProvider {
                 );
                 let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
                 if !has_available {
-                    return Err(UpstreamError::new(Some(429), &body, ctx.id)
+                    return Err(self.upstream_error_for(Some(429), &body, ctx.id)
                         .exhausted()
                         .into_anyhow());
                 }
-                last_error = Some(UpstreamError::new(Some(429), &body, ctx.id).into_anyhow());
+                last_error = Some(self.upstream_error_for(Some(429), &body, ctx.id).into_anyhow());
                 // 不 sleep：下一轮 acquire_context 会自动跳过冷却中的凭据
                 continue;
             }
@@ -698,7 +716,7 @@ impl KiroProvider {
                     body
                 );
                 last_error =
-                    Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                    Some(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -707,7 +725,7 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                return Err(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -719,7 +737,7 @@ impl KiroProvider {
                 body
             );
             last_error =
-                Some(UpstreamError::new(Some(status.as_u16()), &body, ctx.id).into_anyhow());
+                Some(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id).into_anyhow());
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
