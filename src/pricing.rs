@@ -100,10 +100,8 @@ impl PricingTable {
         }
         let mut best: Option<(&String, &ModelPrice)> = None;
         for (k, v) in &self.table {
-            if norm.starts_with(k.as_str()) {
-                if best.map_or(true, |(bk, _)| k.len() > bk.len()) {
-                    best = Some((k, v));
-                }
+            if norm.starts_with(k.as_str()) && best.is_none_or(|(bk, _)| k.len() > bk.len()) {
+                best = Some((k, v));
             }
         }
         best.map(|(_, v)| v).unwrap_or(&self.fallback)
