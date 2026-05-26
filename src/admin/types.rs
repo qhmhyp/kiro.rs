@@ -71,6 +71,16 @@ pub struct CredentialStatusItem {
     /// 最近一次上游错误快照（成功调用后清空）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<crate::kiro::token_manager::RecentError>,
+    /// 累计消耗金额（USD）
+    pub cost_usd: f64,
+    /// 累计输入 token
+    pub input_tokens_total: u64,
+    /// 累计 cache_read token
+    pub cache_read_tokens_total: u64,
+    /// 累计 cache_creation token
+    pub cache_creation_tokens_total: u64,
+    /// 累计输出 token
+    pub output_tokens_total: u64,
 }
 
 // ============ 操作请求 ============

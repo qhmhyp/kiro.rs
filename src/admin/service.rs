@@ -94,6 +94,11 @@ impl AdminService {
                 name: entry.name,
                 cooldown_until: entry.cooldown_until,
                 last_error: entry.last_error,
+                cost_usd: entry.cost_usd,
+                input_tokens_total: entry.input_tokens_total,
+                cache_read_tokens_total: entry.cache_read_tokens_total,
+                cache_creation_tokens_total: entry.cache_creation_tokens_total,
+                output_tokens_total: entry.output_tokens_total,
             })
             .collect();
 
