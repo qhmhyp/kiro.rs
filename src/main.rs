@@ -6,6 +6,7 @@ mod http_client;
 mod kiro;
 mod model;
 pub mod token;
+mod pricing;
 
 use std::collections::HashMap;
 use std::sync::Arc;
