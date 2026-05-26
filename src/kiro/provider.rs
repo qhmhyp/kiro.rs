@@ -224,8 +224,13 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, u64)> {
         self.call_api_with_retry(request_body, false).await
+    }
+
+    /// 暴露底层 token manager（供 anthropic 层记账金额）
+    pub fn token_manager(&self) -> std::sync::Arc<MultiTokenManager> {
+        self.token_manager.clone()
     }
 
     /// 用指定凭据发送一次非流式 API 请求，**不重试、不切换凭据、不冷却**。
@@ -330,7 +335,7 @@ impl KiroProvider {
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, u64)> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -530,7 +535,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -605,7 +610,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok((response, ctx.id));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
