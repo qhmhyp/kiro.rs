@@ -446,14 +446,15 @@ async fn handle_stream_request(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (response, credential_id) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
-        .with_usage_cache(convo_cache, conversation_id, current_turn_tokens);
+        .with_usage_cache(convo_cache, conversation_id, current_turn_tokens)
+        .with_cost_sink(provider.token_manager(), credential_id);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -586,7 +587,7 @@ async fn handle_non_stream_request(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let (response, credential_id) = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -747,6 +748,16 @@ async fn handle_non_stream_request(
     let (cache_read, cache_creation, input_tokens_split) =
         convo_cache.peek(&conversation_id, final_input_tokens, current_turn_tokens);
     convo_cache.commit(&conversation_id, final_input_tokens, current_turn_tokens);
+
+    // 记账：折算本次 usage 金额累计到凭据
+    provider.token_manager().add_cost(
+        credential_id,
+        model,
+        input_tokens_split,
+        cache_read,
+        cache_creation,
+        output_tokens,
+    );
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -998,14 +1009,15 @@ async fn handle_stream_request_buffered(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (response, credential_id) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map)
-        .with_usage_cache(convo_cache, conversation_id, current_turn_tokens);
+        .with_usage_cache(convo_cache, conversation_id, current_turn_tokens)
+        .with_cost_sink(provider.token_manager(), credential_id);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
