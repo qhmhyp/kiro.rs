@@ -220,6 +220,28 @@ docker-compose up
 }
 ```
 
+### 可选：自定义模型单价（用于「消耗金额」统计）
+
+管理员页面会按「真实 token × 模型单价」累计每个凭据的消耗金额（USD）。单价默认使用内置价格表（Anthropic Claude 4 系列挂牌价；cache 命中按 Anthropic 倍率：cache_read ≈ 0.1× input，cache_creation ≈ 1.25× input）。未知模型按 Sonnet 档兜底。
+
+如需覆盖，可在 `config.json` 加 `pricing` 节点（单位：USD / token）：
+
+```json
+{
+  "pricing": {
+    "claude-opus-4-7": {
+      "input": 0.000015,
+      "output": 0.000075,
+      "cacheRead": 0.0000015,
+      "cacheCreation": 0.00001875
+    }
+  }
+}
+```
+
+- key 为模型 id；可只覆盖部分模型，其余沿用内置价。
+- 金额为永久累计，持久化在 `kiro_stats.json`，按记录时刻的单价计入（改价不回溯历史）。
+
 ### credentials.json
 
 支持单对象格式（向后兼容）或数组格式（多凭据）。
