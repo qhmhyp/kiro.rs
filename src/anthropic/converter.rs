@@ -81,7 +81,8 @@ Complete all chunked operations without commentary.";
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
-/// - 其他 opus → claude-opus-4.6
+/// - opus 4.7/4-7 → claude-opus-4.7
+/// - 其他 opus → claude-opus-4.6（宽松兜底）
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
@@ -95,7 +96,10 @@ pub fn map_model(model: &str) -> Option<String> {
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
+        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+            Some("claude-opus-4.7".to_string())
         } else {
+            // 宽松兜底：未识别小版本的 opus 仍映射到 4.6，保持兼容
             Some("claude-opus-4.6".to_string())
         }
     } else if model_lower.contains("haiku") {
@@ -108,10 +112,16 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
+/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。Opus 4.7 同为 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" => 1_000_000,
+        Some(mapped)
+            if mapped == "claude-sonnet-4.6"
+                || mapped == "claude-opus-4.6"
+                || mapped == "claude-opus-4.7" =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -962,6 +972,53 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_opus_4_7() {
+        // opus 4.7（含连字符与点号写法）应映射到 claude-opus-4.7，不再降级 4.6
+        assert_eq!(
+            map_model("claude-opus-4-7"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4.7"),
+            Some("claude-opus-4.7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_opus_4_7() {
+        // thinking 后缀不应影响 opus 4.7 模型映射
+        assert_eq!(
+            map_model("claude-opus-4-7-thinking"),
+            Some("claude-opus-4.7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_opus_fallback_unversioned() {
+        // 回归保护：未识别小版本的 opus 仍走宽松兜底 → 4.6（保持兼容，未改成 None）
+        assert_eq!(
+            map_model("claude-opus-4-20250514"),
+            Some("claude-opus-4.6".to_string())
+        );
+        // 4.6 显式仍为 4.6
+        assert_eq!(
+            map_model("claude-opus-4-6"),
+            Some("claude-opus-4.6".to_string())
+        );
+    }
+
+    #[test]
+    fn test_context_window_opus_4_7_is_1m() {
+        // Opus 4.7 与 4.6/sonnet 4.6 一样是 1M 上下文
+        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4-7-thinking"), 1_000_000);
+        // 回归：未识别小版本 opus（兜底 4.6）也是 1M
+        assert_eq!(get_context_window_size("claude-opus-4-6"), 1_000_000);
+        // 4.5 仍是 200k
+        assert_eq!(get_context_window_size("claude-opus-4-5-20251101"), 200_000);
     }
 
     #[test]
