@@ -799,7 +799,7 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.6 / 4.7：覆写为 adaptive 类型 + OutputConfig{effort:"high"}
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -808,10 +808,14 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    // Opus 4.6 起引入 adaptive thinking，4.7 同系列沿用同一处理
+    let is_opus_adaptive = model_lower.contains("opus")
+        && (model_lower.contains("4-6")
+            || model_lower.contains("4.6")
+            || model_lower.contains("4-7")
+            || model_lower.contains("4.7"));
 
-    let thinking_type = if is_opus_4_6 {
+    let thinking_type = if is_opus_adaptive {
         "adaptive"
     } else {
         "enabled"
@@ -827,8 +831,8 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
-    if is_opus_4_6 {
+
+    if is_opus_adaptive {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -1224,5 +1228,48 @@ mod tests {
     fn sanitize_for_header_respects_max_chars() {
         let s = sanitize_for_header(&"a".repeat(500), 100);
         assert_eq!(s.len(), 100);
+    }
+
+    fn req_with_model(model: &str) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "max_tokens": 1000,
+            "messages": [],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn thinking_override_opus_4_7_uses_adaptive() {
+        // Opus 4.7-thinking 应与 4.6 一致：adaptive + OutputConfig{effort:"high"}
+        let mut p = req_with_model("claude-opus-4-7-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "adaptive");
+        assert_eq!(p.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn thinking_override_opus_4_6_still_adaptive() {
+        // 回归：4.6 行为不变
+        let mut p = req_with_model("claude-opus-4-6-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "adaptive");
+        assert_eq!(p.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn thinking_override_non_opus_uses_enabled_without_output_config() {
+        let mut p = req_with_model("claude-sonnet-4-6-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "enabled");
+        assert!(p.output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_override_skipped_without_thinking_suffix() {
+        let mut p = req_with_model("claude-opus-4-7");
+        override_thinking_from_model_name(&mut p);
+        assert!(p.thinking.is_none());
+        assert!(p.output_config.is_none());
     }
 }
