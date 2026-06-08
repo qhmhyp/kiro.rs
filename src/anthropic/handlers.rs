@@ -464,7 +464,10 @@ async fn handle_stream_request(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider.call_api_stream(request_body).await {
+    let (response, credential_id) = match provider
+        .call_api_stream(request_body, Some(&conversation_id))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -605,7 +608,10 @@ async fn handle_non_stream_request(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider.call_api(request_body).await {
+    let (response, credential_id) = match provider
+        .call_api(request_body, Some(&conversation_id))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -1031,7 +1037,10 @@ async fn handle_stream_request_buffered(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider.call_api_stream(request_body).await {
+    let (response, credential_id) = match provider
+        .call_api_stream(request_body, Some(&conversation_id))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };

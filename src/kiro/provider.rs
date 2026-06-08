@@ -224,8 +224,13 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, u64)> {
-        self.call_api_with_retry(request_body, false).await
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
+        self.call_api_with_retry(request_body, false, conversation_id)
+            .await
     }
 
     /// 暴露底层 token manager（供 anthropic 层记账金额）
@@ -335,8 +340,13 @@ impl KiroProvider {
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, u64)> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
+        self.call_api_with_retry(request_body, true, conversation_id)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -352,8 +362,8 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            // MCP 调用（WebSearch 等工具）不涉及模型选择和会话粘性
+            let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -535,6 +545,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        conversation_id: Option<&str>,
     ) -> anyhow::Result<(reqwest::Response, u64)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -547,7 +558,11 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), conversation_id)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);

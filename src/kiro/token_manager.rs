@@ -604,6 +604,8 @@ pub struct MultiTokenManager {
     stats_dirty: AtomicBool,
     /// 模型单价表（内置默认 + config 覆盖），构造时装配一次
     pricing: crate::pricing::PricingTable,
+    /// 会话→凭据粘性映射，最大化上游 prompt cache 命中率
+    convo_sticky: moka::sync::Cache<String, u64>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -744,6 +746,11 @@ impl MultiTokenManager {
         let pricing = crate::pricing::PricingTable::builtin()
             .with_overrides(config.pricing.as_ref());
 
+        let convo_sticky = moka::sync::Cache::builder()
+            .max_capacity(50_000)
+            .time_to_idle(StdDuration::from_secs(600))
+            .build();
+
         let manager = Self {
             config,
             proxy,
@@ -754,6 +761,7 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             pricing,
+            convo_sticky,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -836,6 +844,62 @@ impl MultiTokenManager {
         Some(result)
     }
 
+    /// 带会话粘性的凭据选择：同一 conversation_id 尽量复用同一凭据，最大化上游 prompt cache 命中
+    ///
+    /// 1. 若有粘性映射且凭据仍可用 → 直接返回（cache hit）
+    /// 2. 粘性凭据不可用 → 失效映射，回退 LRU
+    /// 3. 无 conversation_id → 纯 LRU（与 `acquire_credential` 行为一致）
+    fn acquire_credential_sticky(
+        &self,
+        model: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        if let Some(conv_id) = conversation_id {
+            if let Some(sticky_id) = self.convo_sticky.get(conv_id) {
+                let mut entries = self.entries.lock();
+                let is_opus = model
+                    .map(|m| m.to_lowercase().contains("opus"))
+                    .unwrap_or(false);
+                let now = Utc::now();
+
+                let usable = entries.iter().any(|e| {
+                    e.id == sticky_id
+                        && !e.disabled
+                        && e.cooldown_until.map_or(true, |t| now >= t)
+                        && (!is_opus || e.credentials.supports_opus())
+                });
+
+                if usable {
+                    if let Some(chosen) = entries.iter_mut().find(|e| e.id == sticky_id) {
+                        chosen.last_used_at = Some(Utc::now().to_rfc3339());
+                        let result = (chosen.id, chosen.credentials.clone());
+                        drop(entries);
+                        self.save_stats_debounced();
+                        tracing::debug!("会话 {} 粘性命中凭据 #{}", conv_id, sticky_id);
+                        return Some(result);
+                    }
+                }
+
+                drop(entries);
+                self.convo_sticky.invalidate(conv_id);
+                tracing::info!(
+                    "会话 {} 粘性凭据 #{} 不可用，回退 LRU",
+                    conv_id,
+                    sticky_id
+                );
+            }
+        }
+
+        let result = self.acquire_credential(model)?;
+
+        if let Some(conv_id) = conversation_id {
+            self.convo_sticky.insert(conv_id.to_string(), result.0);
+            tracing::debug!("会话 {} 绑定凭据 #{}", conv_id, result.0);
+        }
+
+        Some(result)
+    }
+
     /// 自愈：当所有凭据均被 `TooManyFailures` 自动禁用时，重置失败计数并重新启用。
     ///
     /// 仅对 `TooManyFailures` 类型生效；`QuotaExceeded` / `InvalidRefreshToken` /
@@ -872,7 +936,12 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `conversation_id`: 可选的会话 ID，用于凭据粘性路由以最大化上游 prompt cache 命中
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -886,12 +955,11 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = match self.acquire_credential(model) {
+            let (id, credentials) = match self.acquire_credential_sticky(model, conversation_id) {
                 Some(x) => x,
                 None => {
-                    // 全灭：尝试 TooManyFailures 自愈后再选一次
                     if self.self_heal_too_many_failures() {
-                        match self.acquire_credential(model) {
+                        match self.acquire_credential_sticky(model, conversation_id) {
                             Some(x) => x,
                             None => anyhow::bail!("所有凭据均不可用（已禁用或冷却中，0/{}）", total),
                         }
@@ -2469,7 +2537,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2491,7 +2559,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -2535,7 +2603,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2575,7 +2643,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -3063,7 +3131,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None)
+            .acquire_context(None, None)
             .await
             .err()
             .expect("应返回错误")
