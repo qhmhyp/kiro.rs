@@ -116,7 +116,10 @@ impl Event {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
             }
-            EventType::Metering => Ok(Self::Metering(())),
+            EventType::Metering => {
+                tracing::info!("meteringEvent payload: {}", frame.payload_as_str());
+                Ok(Self::Metering(()))
+            }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
