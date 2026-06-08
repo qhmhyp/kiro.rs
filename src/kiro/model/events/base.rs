@@ -117,7 +117,7 @@ impl Event {
                 Ok(Self::ToolUse(payload))
             }
             EventType::Metering => {
-                tracing::info!("meteringEvent payload: {}", frame.payload_as_str());
+                tracing::debug!("meteringEvent payload: {}", frame.payload_as_str());
                 Ok(Self::Metering(()))
             }
             EventType::ContextUsage => {
