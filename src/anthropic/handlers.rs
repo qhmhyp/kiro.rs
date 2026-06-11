@@ -31,14 +31,13 @@ use super::websearch;
 
 /// 上游错误到 HTTP 响应的纯映射（可单测，不涉及 axum Response 类型）
 ///
-/// 返回 (http_status, error_type, body_message, optional_response_headers)
+/// 返回 HTTP 状态码、错误类型、对外通用 message 及响应头所需字段（上游诊断细节只进日志）
 struct UpstreamMapping {
     status: StatusCode,
     error_type: &'static str,
     message: String,
     upstream_status: Option<u16>,
     credential_id: u64,
-    body_preview: String,
     add_retry_after: bool,
 }
 
@@ -48,7 +47,7 @@ fn map_upstream_error(u: &UpstreamError) -> UpstreamMapping {
         Some(s) if (400..500).contains(&s) => {
             StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY)
         }
-        // 5xx / 网络错误：CF 会替换 body，但至少 header 还能透传
+        // 5xx / 网络错误：统一映射 502，真实状态码经 x-upstream-status header 透传
         _ => StatusCode::BAD_GATEWAY,
     };
     let error_type = match u.status {
@@ -58,44 +57,25 @@ fn map_upstream_error(u: &UpstreamError) -> UpstreamMapping {
         Some(s) if (400..500).contains(&s) => "invalid_request_error",
         _ => "api_error",
     };
-    let upstream_label = u
-        .status
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "network".to_string());
-    let exhausted = if u.all_credentials_exhausted {
-        "（所有凭据已用尽）"
-    } else {
-        ""
-    };
-    let message = format!(
-        "上游 {} 凭据 #{}{}: {}",
-        upstream_label, u.credential_id, exhausted, u.body
-    );
+    let message = public_upstream_error_message(u.status).to_string();
     UpstreamMapping {
         status,
         error_type,
         message,
         upstream_status: u.status,
         credential_id: u.credential_id,
-        body_preview: sanitize_for_header(&u.body, 300),
         add_retry_after: u.all_credentials_exhausted && status == StatusCode::TOO_MANY_REQUESTS,
     }
 }
 
-/// 保留 ASCII 可见字符（含空格），其他用 ? 替换；用于放进 HTTP header value
-///
-/// HTTP/1.1 spec 不允许 header value 含非 ASCII，axum 的 HeaderValue::from_str 会拒绝。
-fn sanitize_for_header(s: &str, max_chars: usize) -> String {
-    s.chars()
-        .map(|c| {
-            if c == ' ' || (c.is_ascii_graphic() && c != '\r' && c != '\n') {
-                c
-            } else {
-                '?'
-            }
-        })
-        .take(max_chars)
-        .collect()
+fn public_upstream_error_message(status: Option<u16>) -> &'static str {
+    match status {
+        Some(429) => "Upstream service is rate limited. Please retry later.",
+        Some(401) => "Upstream service authentication failed.",
+        Some(402) | Some(403) => "Upstream service permission denied.",
+        Some(s) if (400..500).contains(&s) => "Upstream service rejected the request.",
+        _ => "Upstream service is unavailable. Please try again later.",
+    }
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -128,8 +108,7 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
-    // 结构化上游错误：按真实状态码透传，并通过 header 携带诊断信息
-    // （前面有反代 / CF 时，5xx body 会被替换，但 header 默认透传）
+    // 结构化上游错误：按真实状态码和错误类型返回，详细诊断只写日志/内部状态。
     if let Some(u) = err
         .chain()
         .find_map(|e| e.downcast_ref::<UpstreamError>())
@@ -153,14 +132,6 @@ fn map_provider_error(err: Error) -> Response {
                 headers.insert(HeaderName::from_static("x-upstream-status"), v);
             }
         }
-        if let Ok(v) = HeaderValue::from_str(&mapping.credential_id.to_string()) {
-            headers.insert(HeaderName::from_static("x-upstream-credential"), v);
-        }
-        if !mapping.body_preview.is_empty() {
-            if let Ok(v) = HeaderValue::from_str(&mapping.body_preview) {
-                headers.insert(HeaderName::from_static("x-upstream-body"), v);
-            }
-        }
         if mapping.add_retry_after {
             headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
         }
@@ -173,7 +144,7 @@ fn map_provider_error(err: Error) -> Response {
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败: {}", err),
+            public_upstream_error_message(None),
         )),
     )
         .into_response()
@@ -1168,12 +1139,19 @@ mod tests {
 
     #[test]
     fn maps_upstream_429_to_too_many_requests() {
-        let u = err_for(Some(429), "Due to suspicious activity", false);
+        let u = err_for(
+            Some(429),
+            r#"{"message":"Due to suspicious activity","user":"f4d854a8"}"#,
+            false,
+        );
         let m = map_upstream_error(&u);
         assert_eq!(m.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(m.error_type, "rate_limit_error");
-        assert!(m.message.contains("429"));
-        assert!(m.message.contains("suspicious activity"));
+        assert_eq!(
+            m.message,
+            "Upstream service is rate limited. Please retry later."
+        );
+        assert_public_error_message_is_sanitized(&m.message);
         assert_eq!(m.upstream_status, Some(429));
         assert_eq!(m.credential_id, 4);
         assert!(!m.add_retry_after, "单次 429 不应加 Retry-After");
@@ -1185,7 +1163,8 @@ mod tests {
         let m = map_upstream_error(&u);
         assert_eq!(m.status, StatusCode::TOO_MANY_REQUESTS);
         assert!(m.add_retry_after, "全凭据冷却时应加 Retry-After");
-        assert!(m.message.contains("所有凭据已用尽"));
+        assert_public_error_message_is_sanitized(&m.message);
+        assert!(!m.message.contains("所有凭据已用尽"));
     }
 
     #[test]
@@ -1217,26 +1196,80 @@ mod tests {
         let u = err_for(None, "connection reset by peer", false);
         let m = map_upstream_error(&u);
         assert_eq!(m.status, StatusCode::BAD_GATEWAY);
-        assert!(m.message.contains("network"));
+        assert_eq!(
+            m.message,
+            "Upstream service is unavailable. Please try again later."
+        );
+        assert_public_error_message_is_sanitized(&m.message);
     }
 
-    #[test]
-    fn sanitize_for_header_strips_non_ascii_and_control_chars() {
-        let s = sanitize_for_header("hello\n中文\tworld\r行", 100);
-        assert!(!s.contains('\n'));
-        assert!(!s.contains('\t'));
-        assert!(!s.contains('\r'));
-        // ASCII 可见字符保留
-        assert!(s.contains("hello"));
-        assert!(s.contains("world"));
-        // 非 ASCII 字符变成 ?
-        assert!(s.contains('?'));
+    #[tokio::test]
+    async fn provider_error_response_does_not_expose_upstream_diagnostics() {
+        let u = err_for(
+            Some(403),
+            r#"{"message":"Your User ID (f4d854a8) temporarily is suspended","support_form":"https://app.kiro.dev/account/usage?support_form"}"#,
+            true,
+        );
+        let response = map_provider_error(u.into_anyhow());
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key("x-upstream-body"));
+        assert!(!response.headers().contains_key("x-upstream-credential"));
+        assert!(response.headers().contains_key("x-upstream-status"));
+
+        let message = response_error_message(response).await;
+        assert_eq!(message, "Upstream service permission denied.");
+        assert_public_error_message_is_sanitized(&message);
     }
 
-    #[test]
-    fn sanitize_for_header_respects_max_chars() {
-        let s = sanitize_for_header(&"a".repeat(500), 100);
-        assert_eq!(s.len(), 100);
+    #[tokio::test]
+    async fn unstructured_provider_error_response_is_generic() {
+        let err = anyhow::anyhow!("raw upstream token abc123 failed for credential #15");
+        let response = map_provider_error(err);
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key("x-upstream-body"));
+        assert!(!response.headers().contains_key("x-upstream-credential"));
+
+        let message = response_error_message(response).await;
+        assert_eq!(
+            message,
+            "Upstream service is unavailable. Please try again later."
+        );
+        assert!(!message.contains("abc123"));
+        assert!(!message.contains("credential #15"));
+    }
+
+    async fn response_error_message(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body should be JSON");
+        value["error"]["message"]
+            .as_str()
+            .expect("error.message should be a string")
+            .to_string()
+    }
+
+    fn assert_public_error_message_is_sanitized(message: &str) {
+        for leaked in [
+            "凭据",
+            "credential",
+            "所有凭据",
+            "suspicious activity",
+            "f4d854a8",
+            "support_form",
+            "Your User ID",
+            "connection reset",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "public error message leaked `{}`: {}",
+                leaked,
+                message
+            );
+        }
     }
 
     fn req_with_model(model: &str) -> MessagesRequest {

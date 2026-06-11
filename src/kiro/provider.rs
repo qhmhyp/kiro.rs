@@ -28,8 +28,8 @@ const MAX_TOTAL_RETRIES: usize = 9;
 
 /// 上游错误结构化信息（通过 [`anyhow::Error::downcast_ref`] 获取）
 ///
-/// 用于让 HTTP handler 把上游真实状态码与响应体透传给客户端，
-/// 而不是统一吞成 502（CF / 反代会替换 5xx body，错误信息丢失）。
+/// 用于让 HTTP handler 保留上游真实状态码与错误分类，同时把详细响应体留在日志和
+/// 内部状态中，避免把上游诊断细节直接返回给客户端。
 #[derive(Debug, Clone)]
 pub struct UpstreamError {
     /// 上游 HTTP 状态码；网络层 / 链路错误时为 None
