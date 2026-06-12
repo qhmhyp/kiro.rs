@@ -12,6 +12,8 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
+    /// 全局在途请求总数
+    pub total_in_flight: u32,
     /// 当前活跃凭据 ID
     pub current_id: u64,
     /// 各凭据状态列表
@@ -48,6 +50,10 @@ pub struct CredentialStatusItem {
     pub email: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 当前在途请求数(实时并发)
+    pub in_flight: u32,
+    /// 进程启动以来最高瞬时并发
+    pub in_flight_peak: u32,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理

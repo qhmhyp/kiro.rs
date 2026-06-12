@@ -85,6 +85,8 @@ impl AdminService {
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
                 success_count: entry.success_count,
+                in_flight: entry.in_flight,
+                in_flight_peak: entry.in_flight_peak,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
@@ -105,9 +107,12 @@ impl AdminService {
         // 按优先级排序（数字越小优先级越高）
         credentials.sort_by_key(|c| c.priority);
 
+        let total_in_flight: u32 = credentials.iter().map(|c| c.in_flight).sum();
+
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
+            total_in_flight,
             current_id: snapshot.current_id,
             credentials,
         }

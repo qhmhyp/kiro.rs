@@ -568,6 +568,10 @@ pub struct CredentialEntrySnapshot {
     pub cache_creation_tokens_total: u64,
     /// 累计输出 token
     pub output_tokens_total: u64,
+    /// 当前在途请求数(实时并发)
+    pub in_flight: u32,
+    /// 进程启动以来最高瞬时并发
+    pub in_flight_peak: u32,
 }
 
 /// 凭据管理器状态快照
@@ -1741,6 +1745,7 @@ impl MultiTokenManager {
     /// `current_id` 按 `last_used_at` 最新（最近一次被选中）的 entry 计算；
     /// 没有任何 entry 被选中过时为 0。该字段仅用于前端展示，不参与调度。
     pub fn snapshot(&self) -> ManagerSnapshot {
+        let in_flight = self.in_flight.snapshot();
         let entries = self.entries.lock();
         let current_id = entries
             .iter()
@@ -1817,6 +1822,8 @@ impl MultiTokenManager {
                     cache_read_tokens_total: e.cache_read_tokens_total,
                     cache_creation_tokens_total: e.cache_creation_tokens_total,
                     output_tokens_total: e.output_tokens_total,
+                    in_flight: in_flight.get(&e.id).map(|v| v.0).unwrap_or(0),
+                    in_flight_peak: in_flight.get(&e.id).map(|v| v.1).unwrap_or(0),
                 })
                 .collect(),
             current_id,
@@ -3545,5 +3552,17 @@ mod tests {
         assert_eq!(records[0].credential, 1);
         assert_eq!(records[0].kind, "baseline");
         assert_eq!(records[0].attempt, None);
+    }
+
+    #[test]
+    fn snapshot_includes_in_flight_fields() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        let _g = manager.track_request_start(1);
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.in_flight, 1);
+        assert_eq!(e.in_flight_peak, 1);
     }
 }
