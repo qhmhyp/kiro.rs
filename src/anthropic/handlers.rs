@@ -435,7 +435,7 @@ async fn handle_stream_request(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider
+    let (response, credential_id, in_flight_guard) = match provider
         .call_api_stream(request_body, Some(&conversation_id))
         .await
     {
@@ -452,7 +452,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, in_flight_guard);
 
     // 返回 SSE 响应
     Response::builder()
@@ -477,6 +477,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    in_flight_guard: crate::kiro::in_flight::InFlightGuard,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -561,7 +562,12 @@ fn create_sse_stream(
     )
     .flatten();
 
-    initial_stream.chain(processing_stream)
+    let combined = initial_stream.chain(processing_stream);
+    // guard 被 move 进闭包:流 drop(播完或客户端断开)时计数自动归还
+    combined.map(move |item| {
+        let _keep = &in_flight_guard;
+        item
+    })
 }
 
 use super::converter::get_context_window_size;
@@ -579,7 +585,7 @@ async fn handle_non_stream_request(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider
+    let (response, credential_id, _in_flight_guard) = match provider
         .call_api(request_body, Some(&conversation_id))
         .await
     {
@@ -1008,7 +1014,7 @@ async fn handle_stream_request_buffered(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider
+    let (response, credential_id, in_flight_guard) = match provider
         .call_api_stream(request_body, Some(&conversation_id))
         .await
     {
@@ -1022,7 +1028,7 @@ async fn handle_stream_request_buffered(
         .with_cost_sink(provider.token_manager(), credential_id);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, in_flight_guard);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1044,10 +1050,11 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    in_flight_guard: crate::kiro::in_flight::InFlightGuard,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
-    stream::unfold(
+    let inner = stream::unfold(
         (
             body_stream,
             ctx,
@@ -1122,7 +1129,12 @@ fn create_buffered_sse_stream(
             }
         },
     )
-    .flatten()
+    .flatten();
+    // guard 被 move 进闭包:流 drop(播完或客户端断开)时计数自动归还
+    inner.map(move |item| {
+        let _keep = &in_flight_guard;
+        item
+    })
 }
 
 #[cfg(test)]

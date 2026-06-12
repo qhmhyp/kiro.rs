@@ -1362,6 +1362,9 @@ impl MultiTokenManager {
     }
 
     /// 事故快照:专用 target 结构化日志 + JSONL 落盘(best-effort)
+    ///
+    /// 注意:调用时触发事故的那次请求仍在途(guard 未 drop),故 in_flight ≥ 1
+    /// 且含其自身;分析侧不要把它误读为"另有 N 条并发"。
     pub fn log_rate_limit_incident(
         &self,
         id: u64,

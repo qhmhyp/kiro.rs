@@ -224,11 +224,12 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
+    /// 返回 (Response, 凭据id, InFlightGuard)；guard 存活到调用方丢弃，计数自动归还。
     pub async fn call_api(
         &self,
         request_body: &str,
         conversation_id: Option<&str>,
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+    ) -> anyhow::Result<(reqwest::Response, u64, crate::kiro::in_flight::InFlightGuard)> {
         self.call_api_with_retry(request_body, false, conversation_id)
             .await
     }
@@ -259,6 +260,8 @@ impl KiroProvider {
                 );
             }
         };
+
+        let _in_flight_guard = self.token_manager.track_request_start(ctx.id);
 
         let config = self.token_manager.config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -340,11 +343,12 @@ impl KiroProvider {
     }
 
     /// 发送流式 API 请求
+    /// 返回 (Response, 凭据id, InFlightGuard)；guard 存活到调用方丢弃，计数自动归还。
     pub async fn call_api_stream(
         &self,
         request_body: &str,
         conversation_id: Option<&str>,
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+    ) -> anyhow::Result<(reqwest::Response, u64, crate::kiro::in_flight::InFlightGuard)> {
         self.call_api_with_retry(request_body, true, conversation_id)
             .await
     }
@@ -370,6 +374,8 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            let _in_flight_guard = self.token_manager.track_request_start(ctx.id);
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -546,7 +552,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         conversation_id: Option<&str>,
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+    ) -> anyhow::Result<(reqwest::Response, u64, crate::kiro::in_flight::InFlightGuard)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -569,6 +575,9 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            // 每次上游尝试都登记:在途 +1(guard 随本轮作用域 drop 自动归还)、窗口记 start
+            let in_flight_guard = self.token_manager.track_request_start(ctx.id);
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -625,7 +634,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok((response, ctx.id));
+                return Ok((response, ctx.id, in_flight_guard));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -641,6 +650,13 @@ impl KiroProvider {
                     body
                 );
 
+                self.token_manager.log_rate_limit_incident(
+                    ctx.id,
+                    "402_quota",
+                    model.as_deref(),
+                    attempt as u32 + 1,
+                    None,
+                );
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id)
@@ -679,6 +695,13 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
+                self.token_manager.log_rate_limit_incident(
+                    ctx.id,
+                    "40x_auth",
+                    model.as_deref(),
+                    attempt as u32 + 1,
+                    None,
+                );
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id)
@@ -709,6 +732,13 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries,
                     body
+                );
+                self.token_manager.log_rate_limit_incident(
+                    ctx.id,
+                    if is_suspicious { "429_suspicious" } else { "429_transient" },
+                    model.as_deref(),
+                    attempt as u32 + 1,
+                    Some(cooldown.as_secs()),
                 );
                 let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
                 if !has_available {
