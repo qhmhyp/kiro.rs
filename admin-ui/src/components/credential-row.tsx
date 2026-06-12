@@ -373,6 +373,20 @@ export function CredentialRow({
           </div>
         </td>
 
+        {/* 并发 */}
+        <td className="px-2 py-2 text-sm whitespace-nowrap">
+          {credential.inFlightPeak === 0 ? (
+            <span className="text-xs text-muted-foreground">-</span>
+          ) : (
+            <>
+              <span className={credential.inFlight > 0 ? 'font-medium text-green-600' : 'text-muted-foreground'}>
+                {credential.inFlight}
+              </span>
+              <span className="text-xs text-muted-foreground"> / {credential.inFlightPeak}</span>
+            </>
+          )}
+        </td>
+
         {/* 失败 / 用量 */}
         <td className="px-2 py-2 text-sm whitespace-nowrap">
           <div className="flex flex-col gap-0.5">

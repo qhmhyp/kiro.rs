@@ -17,7 +17,7 @@ export function useCredentials() {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    refetchInterval: 2000, // 秒级并发观测;refetchIntervalInBackground 默认 false,标签页转后台时停轮
   })
 }
 

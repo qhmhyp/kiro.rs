@@ -3,6 +3,7 @@ export interface CredentialsStatusResponse {
   total: number
   available: number
   currentId: number
+  totalInFlight: number
   credentials: CredentialStatusItem[]
 }
 
@@ -21,6 +22,8 @@ export interface CredentialStatusItem {
   apiKeyHash?: string
   maskedApiKey?: string
   successCount: number
+  inFlight: number
+  inFlightPeak: number
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
