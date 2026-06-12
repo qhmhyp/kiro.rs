@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::activity_window::{ActivityWindow, WindowStats};
+use crate::kiro::in_flight::{InFlightGuard, InFlightTracker};
+use crate::kiro::incident_log::{self, IncidentRecord};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -606,6 +609,11 @@ pub struct MultiTokenManager {
     pricing: crate::pricing::PricingTable,
     /// 会话→凭据粘性映射，最大化上游 prompt cache 命中率
     convo_sticky: moka::sync::Cache<String, u64>,
+    /// 在途请求计数(实时并发观测)
+    in_flight: InFlightTracker,
+    /// 每凭据滚动活动窗口(限速观测);与 entries 锁独立,避免热路径锁竞争。
+    /// 锁序约束:绝不在持有 entries 锁时再取本锁(反之亦然),防死锁。
+    activity: Mutex<HashMap<u64, ActivityWindow>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -762,6 +770,8 @@ impl MultiTokenManager {
             stats_dirty: AtomicBool::new(false),
             pricing,
             convo_sticky,
+            in_flight: InFlightTracker::default(),
+            activity: Mutex::new(HashMap::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1296,6 +1306,121 @@ impl MultiTokenManager {
         self.save_stats_debounced();
     }
 
+    /// 暴露在途计数器(admin 快照读取)
+    pub fn in_flight(&self) -> &InFlightTracker {
+        &self.in_flight
+    }
+
+    /// 登记一次上游请求尝试:在途 +1(guard 归还)、活动窗口记 start。
+    /// 每次"上游 POST"都算一次,故障转移重试各算一次——限速分析关心的
+    /// 正是上游视角的请求频率。
+    pub fn track_request_start(&self, id: u64) -> InFlightGuard {
+        self.activity
+            .lock()
+            .entry(id)
+            .or_default()
+            .record_start(Utc::now());
+        self.in_flight.track(id)
+    }
+
+    /// 该凭据当前窗口统计(测试与观测记录共用)。
+    /// 注意:有条目时会顺带修剪过期事件(stats 内部 prune);无条目返回全零,不创建条目。
+    pub fn window_stats(&self, id: u64) -> WindowStats {
+        self.activity
+            .lock()
+            .get_mut(&id)
+            .map(|w| w.stats(Utc::now()))
+            .unwrap_or_default()
+    }
+
+    /// 组装一条观测记录(事故快照与基线采样共用)
+    pub fn build_observability_record(
+        &self,
+        id: u64,
+        kind: &str,
+        model: Option<&str>,
+        attempt: Option<u32>,
+        cooldown_secs: Option<u64>,
+    ) -> IncidentRecord {
+        let stats = self.window_stats(id);
+        let (in_flight, in_flight_peak) = self.in_flight.get(id);
+        IncidentRecord {
+            ts: Utc::now().to_rfc3339(),
+            credential: id,
+            kind: kind.to_string(),
+            in_flight,
+            in_flight_peak,
+            req_1m: stats.req_1m,
+            req_5m: stats.req_5m,
+            tokens_in_1m: stats.tokens_in_1m,
+            tokens_out_1m: stats.tokens_out_1m,
+            model: model.map(str::to_string),
+            attempt,
+            secs_since_last_429: stats.secs_since_last_429,
+            cooldown_secs,
+        }
+    }
+
+    /// 事故快照:专用 target 结构化日志 + JSONL 落盘(best-effort)
+    pub fn log_rate_limit_incident(
+        &self,
+        id: u64,
+        kind: &str,
+        model: Option<&str>,
+        attempt: u32,
+        cooldown_secs: Option<u64>,
+    ) {
+        let r = self.build_observability_record(id, kind, model, Some(attempt), cooldown_secs);
+        tracing::warn!(
+            target: "rate_limit_incident",
+            credential = r.credential,
+            kind = %r.kind,
+            in_flight = r.in_flight,
+            in_flight_peak = r.in_flight_peak,
+            req_1m = r.req_1m,
+            req_5m = r.req_5m,
+            tokens_in_1m = r.tokens_in_1m,
+            tokens_out_1m = r.tokens_out_1m,
+            model = r.model.as_deref().unwrap_or(""),
+            attempt = ?r.attempt,
+            secs_since_last_429 = ?r.secs_since_last_429,
+            cooldown_secs = ?r.cooldown_secs,
+            "限速观测事件"
+        );
+        self.append_observability_record(&r);
+    }
+
+    /// 基线采样:返回所有"有活动"凭据的记录(无活动不采,避免无意义数据)
+    pub fn baseline_records(&self) -> Vec<IncidentRecord> {
+        let ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries.iter().map(|e| e.id).collect()
+        };
+        ids.into_iter()
+            .filter(|id| {
+                // filter 与 build_observability_record 各取一次 window_stats(两次短锁)——
+                // 60s 周期的采样路径,不值得为省一次锁引入重复的记录组装代码
+                let stats = self.window_stats(*id);
+                let (cur, _) = self.in_flight.get(*id);
+                stats.req_1m > 0 || cur > 0
+            })
+            .map(|id| self.build_observability_record(id, "baseline", None, None, None))
+            .collect()
+    }
+
+    /// 基线采样落盘(后台任务每 60s 调一次)
+    pub fn log_baseline_samples(&self) {
+        for r in self.baseline_records() {
+            self.append_observability_record(&r);
+        }
+    }
+
+    fn append_observability_record(&self, r: &IncidentRecord) {
+        if let Some(dir) = self.cache_dir() {
+            incident_log::append_jsonl(&dir.join("rate_limit_incidents.jsonl"), r);
+        }
+    }
+
     /// 累计指定凭据的 token 消耗金额（USD）与 token 明细
     ///
     /// 在 anthropic 层算定最终 usage 后调用。金额按记录时刻生效的单价算定累加；
@@ -1336,6 +1461,12 @@ impl MultiTokenManager {
                 );
             }
         }
+        // entries 锁已释放后再取 activity 锁，符合锁序约束
+        self.activity.lock().entry(id).or_default().record_tokens(
+            Utc::now(),
+            (input.max(0) + cache_read.max(0) + cache_creation.max(0)) as u64,
+            output.max(0) as u64,
+        );
         self.save_stats_debounced();
     }
 
@@ -1472,24 +1603,33 @@ impl MultiTokenManager {
     /// # Returns
     /// 调用后是否还有可用凭据（未禁用且未冷却），便于调用方判断要不要继续切换重试
     pub fn report_rate_limited(&self, id: u64, cooldown: StdDuration) -> bool {
-        let mut entries = self.entries.lock();
-        let now = Utc::now();
-        let until = now + Duration::from_std(cooldown).unwrap_or(Duration::seconds(60));
+        let has_available = {
+            let mut entries = self.entries.lock();
+            let now = Utc::now();
+            let until = now + Duration::from_std(cooldown).unwrap_or(Duration::seconds(60));
 
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            entry.cooldown_until = Some(until);
-            entry.last_used_at = Some(now.to_rfc3339());
-            tracing::warn!(
-                "凭据 #{} 被上游限流，冷却 {} 秒至 {}",
-                id,
-                cooldown.as_secs(),
-                until.to_rfc3339()
-            );
-        }
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.cooldown_until = Some(until);
+                entry.last_used_at = Some(now.to_rfc3339());
+                tracing::warn!(
+                    "凭据 #{} 被上游限流，冷却 {} 秒至 {}",
+                    id,
+                    cooldown.as_secs(),
+                    until.to_rfc3339()
+                );
+            }
 
-        entries
-            .iter()
-            .any(|e| !e.disabled && e.cooldown_until.map_or(true, |t| now >= t))
+            entries
+                .iter()
+                .any(|e| !e.disabled && e.cooldown_until.map_or(true, |t| now >= t))
+        };
+        // entries 锁已释放后再取 activity 锁，符合锁序约束
+        self.activity
+            .lock()
+            .entry(id)
+            .or_default()
+            .record_429(Utc::now());
+        has_available
     }
 
     /// 报告指定凭据刷新 Token 失败。
@@ -3320,5 +3460,87 @@ mod tests {
             !manager.report_failure(1),
             "cred1 已禁用且 cred2 在冷却中，应返回 false（无可用凭据）"
         );
+    }
+
+    #[test]
+    fn track_request_start_feeds_in_flight_and_window() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        let g1 = manager.track_request_start(1);
+        let g2 = manager.track_request_start(1);
+        assert_eq!(manager.in_flight().get(1), (2, 2));
+
+        let stats = manager.window_stats(1);
+        assert_eq!(stats.req_1m, 2, "track_request_start 应同时记入活动窗口");
+
+        drop(g1);
+        drop(g2);
+        assert_eq!(manager.in_flight().get(1), (0, 2));
+    }
+
+    #[test]
+    fn add_cost_feeds_token_window() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        manager.add_cost(1, "claude-sonnet-4-5", 1000, 200, 300, 50);
+        let stats = manager.window_stats(1);
+        assert_eq!(stats.tokens_in_1m, 1500, "input+cache_read+cache_creation 都是上游入量");
+        assert_eq!(stats.tokens_out_1m, 50);
+    }
+
+    #[test]
+    fn report_rate_limited_records_429_timestamp() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        assert_eq!(manager.window_stats(1).secs_since_last_429, None);
+        manager.report_rate_limited(1, StdDuration::from_secs(60));
+        let secs = manager.window_stats(1).secs_since_last_429;
+        assert!(matches!(secs, Some(0..=2)));
+    }
+
+    #[test]
+    fn build_observability_record_includes_all_fields() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        let _g = manager.track_request_start(1);
+        let r = manager.build_observability_record(
+            1,
+            "429_suspicious",
+            Some("claude-sonnet-4-5"),
+            Some(3),
+            Some(600),
+        );
+        assert_eq!(r.credential, 1);
+        assert_eq!(r.kind, "429_suspicious");
+        assert_eq!(r.in_flight, 1);
+        assert_eq!(r.req_1m, 1);
+        assert_eq!(r.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(r.attempt, Some(3));
+        assert_eq!(r.cooldown_secs, Some(600));
+        assert!(chrono::DateTime::parse_from_rfc3339(&r.ts).is_ok());
+    }
+
+    #[test]
+    fn baseline_records_skip_idle_credentials() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 仅凭据 1 有活动
+        let _g = manager.track_request_start(1);
+        let records = manager.baseline_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].credential, 1);
+        assert_eq!(records[0].kind, "baseline");
+        assert_eq!(records[0].attempt, None);
     }
 }
