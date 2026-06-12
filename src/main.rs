@@ -149,6 +149,23 @@ async fn main() {
         config.default_endpoint.clone(),
     ));
 
+    // 限速观测基线采样:每 60s 为有活动的凭据落一行 baseline 记录,
+    // 作为 429 事故数据的对照组(详见 docs/superpowers/specs/2026-06-12-*.md)
+    {
+        let tm = token_manager.clone();
+        // JoinHandle 有意丢弃——守护循环随进程退出而终止
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Skip:系统挂起恢复后丢弃错过的 tick,避免补偿性连发写入一堆重复 baseline
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // 第一次 tick 立即返回,跳过
+            loop {
+                interval.tick().await;
+                tm.log_baseline_samples();
+            }
+        });
+    }
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
