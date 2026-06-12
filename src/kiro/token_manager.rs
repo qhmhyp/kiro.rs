@@ -1310,11 +1310,6 @@ impl MultiTokenManager {
         self.save_stats_debounced();
     }
 
-    /// 暴露在途计数器(admin 快照读取)
-    pub fn in_flight(&self) -> &InFlightTracker {
-        &self.in_flight
-    }
-
     /// 登记一次上游请求尝试:在途 +1(guard 归还)、活动窗口记 start。
     /// 每次"上游 POST"都算一次,故障转移重试各算一次——限速分析关心的
     /// 正是上游视角的请求频率。
@@ -3480,14 +3475,14 @@ mod tests {
 
         let g1 = manager.track_request_start(1);
         let g2 = manager.track_request_start(1);
-        assert_eq!(manager.in_flight().get(1), (2, 2));
+        assert_eq!(manager.in_flight.get(1), (2, 2));
 
         let stats = manager.window_stats(1);
         assert_eq!(stats.req_1m, 2, "track_request_start 应同时记入活动窗口");
 
         drop(g1);
         drop(g2);
-        assert_eq!(manager.in_flight().get(1), (0, 2));
+        assert_eq!(manager.in_flight.get(1), (0, 2));
     }
 
     #[test]
