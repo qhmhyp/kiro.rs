@@ -10,6 +10,7 @@
 "安全分钟"(其后 5 分钟内没有 429)的同指标?是 → 配额/令牌桶坐实。
 """
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -22,7 +23,9 @@ def parse(path):
             if not line:
                 continue
             r = json.loads(line)
-            r["t"] = datetime.fromisoformat(r["ts"].replace("Z", "+00:00"))
+            # Rust 的 RFC3339 带纳秒,Python<3.11 的 fromisoformat 只认 6 位小数
+            ts = re.sub(r"\.(\d{6})\d*", r".\1", r["ts"]).replace("Z", "+00:00")
+            r["t"] = datetime.fromisoformat(ts)
             rows.append(r)
     return rows
 
