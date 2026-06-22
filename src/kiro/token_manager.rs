@@ -431,6 +431,8 @@ struct CredentialEntry {
     cache_creation_tokens_total: u64,
     /// 累计输出 token
     output_tokens_total: u64,
+    /// 连续 429 计数:累计 5 次才冷却,避免偶发 429 导致不必要的故障转移和级联
+    consecutive_429_count: u32,
 }
 
 /// 凭据最近一次上游错误（用于状态展示）
@@ -709,6 +711,7 @@ impl MultiTokenManager {
                     cache_read_tokens_total: 0,
                     cache_creation_tokens_total: 0,
                     output_tokens_total: 0,
+                    consecutive_429_count: 0,
                 }
             })
             .collect();
@@ -1296,6 +1299,7 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.consecutive_429_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功一次后清空"最近错误"，状态徽章回归正常
@@ -1593,6 +1597,22 @@ impl MultiTokenManager {
     }
 
     /// 报告指定凭据被上游限流（HTTP 429），将其加入临时冷却。
+    ///
+    /// 递增凭据的 429 连击计数,返回是否应执行冷却(≥5 次时触发)。
+    /// 触发冷却后计数重置,调用方应紧跟 `report_rate_limited`。
+    pub fn increment_429_count(&self, id: u64) -> bool {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.consecutive_429_count += 1;
+            if entry.consecutive_429_count >= 5 {
+                entry.consecutive_429_count = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 报告指定凭据被上游限流（429），设置冷却期使其暂时不可用。
     ///
     /// 冷却期间该凭据不会被 `acquire_credential` 选中；冷却到期后由 `acquire_credential`
     /// 的过滤条件自然恢复可用，无需重启或外部干预。冷却状态**不持久化**——
@@ -2193,6 +2213,7 @@ impl MultiTokenManager {
                 cache_read_tokens_total: 0,
                 cache_creation_tokens_total: 0,
                 output_tokens_total: 0,
+                consecutive_429_count: 0,
             });
         }
 
@@ -2858,6 +2879,7 @@ mod tests {
                 cache_read_tokens_total: 0,
                 cache_creation_tokens_total: 0,
                 output_tokens_total: 0,
+                consecutive_429_count: 0,
             });
         }
 

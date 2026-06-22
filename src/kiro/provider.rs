@@ -479,28 +479,39 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 - 上游限流：冷却凭据后立即换下一个（详见 call_api_with_retry 同名分支注释）
+            // 429 - 上游限流：同主路径逻辑,风控立即冷却,普通 429 连续 5 次才冷却
             if status.as_u16() == 429 {
                 let is_suspicious = body.contains("suspicious activity");
-                let cooldown = if is_suspicious {
-                    Duration::from_secs(600)
-                } else {
-                    Duration::from_secs(60)
-                };
                 tracing::warn!(
-                    "MCP 请求 429（{}，冷却凭据 #{} {} 秒，尝试 {}/{}）: {}",
+                    "MCP 请求 429（{}，凭据 #{}，尝试 {}/{}）: {}",
                     if is_suspicious { "风控" } else { "瞬态" },
                     ctx.id,
-                    cooldown.as_secs(),
                     attempt + 1,
                     max_retries,
                     body
                 );
-                let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
-                if !has_available {
-                    return Err(self.upstream_error_for(Some(429), &body, ctx.id)
-                        .exhausted()
-                        .into_anyhow());
+
+                if is_suspicious {
+                    let cooldown = Duration::from_secs(600);
+                    let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                    if !has_available {
+                        return Err(self.upstream_error_for(Some(429), &body, ctx.id)
+                            .exhausted()
+                            .into_anyhow());
+                    }
+                } else {
+                    let should_cooldown = self.token_manager.increment_429_count(ctx.id);
+                    if should_cooldown {
+                        let cooldown = Duration::from_secs(60);
+                        let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                        if !has_available {
+                            return Err(self.upstream_error_for(Some(429), &body, ctx.id)
+                                .exhausted()
+                                .into_anyhow());
+                        }
+                    } else if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                 }
                 last_error = Some(self.upstream_error_for(Some(429), &body, ctx.id).into_anyhow());
                 continue;
@@ -714,40 +725,63 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 - 上游限流：冷却当前凭据后立即换下一个，不在同一凭据上重试。
-            // 在同一凭据上重试 429 只会加剧风控判定（Kiro 把高频重试视为可疑活动）。
-            // 风控类 429（响应体含 "suspicious activity"）长冷却 10 分钟，普通 429 短冷却 60 秒。
+            // 429 - 上游限流：
+            // - 风控类("suspicious activity")立即冷却 10 分钟
+            // - 普通 429 容忍连续 5 次后才冷却 60 秒,避免偶发限流引起不必要的故障转移级联
             if status.as_u16() == 429 {
                 let is_suspicious = body.contains("suspicious activity");
-                let cooldown = if is_suspicious {
-                    Duration::from_secs(600)
-                } else {
-                    Duration::from_secs(60)
-                };
                 tracing::warn!(
-                    "API 请求 429（{}，冷却凭据 #{} {} 秒，尝试 {}/{}）: {}",
+                    "API 请求 429（{}，凭据 #{}，尝试 {}/{}）: {}",
                     if is_suspicious { "风控" } else { "瞬态" },
                     ctx.id,
-                    cooldown.as_secs(),
                     attempt + 1,
                     max_retries,
                     body
                 );
-                self.token_manager.log_rate_limit_incident(
-                    ctx.id,
-                    if is_suspicious { "429_suspicious" } else { "429_transient" },
-                    model.as_deref(),
-                    attempt as u32 + 1,
-                    Some(cooldown.as_secs()),
-                );
-                let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
-                if !has_available {
-                    return Err(self.upstream_error_for(Some(429), &body, ctx.id)
-                        .exhausted()
-                        .into_anyhow());
+
+                if is_suspicious {
+                    // 风控类：立即冷却 10 分钟
+                    let cooldown = Duration::from_secs(600);
+                    self.token_manager.log_rate_limit_incident(
+                        ctx.id,
+                        "429_suspicious",
+                        model.as_deref(),
+                        attempt as u32 + 1,
+                        Some(cooldown.as_secs()),
+                    );
+                    let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                    if !has_available {
+                        return Err(self.upstream_error_for(Some(429), &body, ctx.id)
+                            .exhausted()
+                            .into_anyhow());
+                    }
+                } else {
+                    // 普通 429：在同一凭据上重试,累计 5 次才冷却。
+                    // 不切换凭据——保留 prompt cache 命中,避免切换引发级联。
+                    let should_cooldown = self.token_manager.increment_429_count(ctx.id);
+                    if should_cooldown {
+                        let cooldown = Duration::from_secs(60);
+                        self.token_manager.log_rate_limit_incident(
+                            ctx.id,
+                            "429_transient",
+                            model.as_deref(),
+                            attempt as u32 + 1,
+                            Some(cooldown.as_secs()),
+                        );
+                        let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                        if !has_available {
+                            return Err(self.upstream_error_for(Some(429), &body, ctx.id)
+                                .exhausted()
+                                .into_anyhow());
+                        }
+                    } else {
+                        // 未达冷却阈值,短暂等待后在同一凭据上重试
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
+                    }
                 }
                 last_error = Some(self.upstream_error_for(Some(429), &body, ctx.id).into_anyhow());
-                // 不 sleep：下一轮 acquire_context 会自动跳过冷却中的凭据
                 continue;
             }
 
