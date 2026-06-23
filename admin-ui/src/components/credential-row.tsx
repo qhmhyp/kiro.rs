@@ -71,6 +71,7 @@ function authMethodLabel(method?: string): string {
   if (method === 'api_key') return 'API Key'
   if (method === 'idc') return 'IdC'
   if (method === 'social') return 'Social'
+  if (method === 'external_idp') return 'External IdP'
   return method ?? '-'
 }
 

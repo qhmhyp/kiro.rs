@@ -77,18 +77,28 @@ export interface SetPriorityRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   clientId?: string
   clientSecret?: string
   priority?: number
   authRegion?: string
   apiRegion?: string
+  region?: string
   machineId?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  // External IdP 专用
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  profileArn?: string
+  email?: string
+  // 导入短路:携带未过期 access_token 跳过初始刷新,避免烧 rotating refresh_token
+  accessToken?: string
+  expiresAt?: string | number
 }
 
 // 最近一次上游错误（成功调用会清空）
@@ -133,4 +143,8 @@ export interface UpdateCredentialRequest {
   proxyPassword?: string
   endpoint?: string
   priority?: number
+  // External IdP 专用
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
 }

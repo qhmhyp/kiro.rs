@@ -22,7 +22,7 @@ interface AddCredentialDialogProps {
   editTarget?: CredentialStatusItem | null
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 
 const initialFormState = () => ({
   name: '',
@@ -39,6 +39,14 @@ const initialFormState = () => ({
   proxyUsername: '',
   proxyPassword: '',
   endpoint: '',
+  // External IdP 专用
+  tokenEndpoint: '',
+  issuerUrl: '',
+  scopes: '',
+  profileArn: '',
+  // 导入短路
+  accessToken: '',
+  expiresAt: '',
 })
 
 export function AddCredentialDialog({
@@ -77,6 +85,7 @@ export function AddCredentialDialog({
   ) => setForm(prev => ({ ...prev, [key]: value }))
 
   const isApiKey = form.authMethod === 'api_key'
+  const isExternalIdp = form.authMethod === 'external_idp'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -101,6 +110,10 @@ export function AddCredentialDialog({
         priority: Number.isFinite(parseInt(form.priority))
           ? parseInt(form.priority)
           : undefined,
+        tokenEndpoint: opt(form.tokenEndpoint),
+        issuerUrl: opt(form.issuerUrl),
+        scopes: opt(form.scopes),
+        profileArn: opt(form.profileArn),
       }
       // JSON.stringify 会自动跳过 undefined，不需要显式删除
       const hasAnyChange = Object.values(payload).some(v => v !== undefined)
@@ -139,6 +152,16 @@ export function AddCredentialDialog({
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
         return
       }
+      if (isExternalIdp) {
+        if (!form.tokenEndpoint.trim()) {
+          toast.error('External IdP 认证必须填写 Token Endpoint')
+          return
+        }
+        if (!form.clientId.trim()) {
+          toast.error('External IdP 认证必须填写 Client ID')
+          return
+        }
+      }
     }
 
     addMutation.mutate(
@@ -156,6 +179,13 @@ export function AddCredentialDialog({
         proxyUsername: form.proxyUsername.trim() || undefined,
         proxyPassword: form.proxyPassword.trim() || undefined,
         endpoint: form.endpoint.trim() || undefined,
+        // External IdP 字段
+        tokenEndpoint: isExternalIdp ? form.tokenEndpoint.trim() || undefined : undefined,
+        issuerUrl: isExternalIdp ? form.issuerUrl.trim() || undefined : undefined,
+        scopes: isExternalIdp ? form.scopes.trim() || undefined : undefined,
+        profileArn: isExternalIdp ? form.profileArn.trim() || undefined : undefined,
+        accessToken: isExternalIdp ? form.accessToken.trim() || undefined : undefined,
+        expiresAt: isExternalIdp ? form.expiresAt.trim() || undefined : undefined,
       },
       {
         onSuccess: (data) => {
@@ -222,6 +252,7 @@ export function AddCredentialDialog({
                 <option value="social">Social</option>
                 <option value="idc">IdC/Builder-ID/IAM</option>
                 <option value="api_key">API Key</option>
+                <option value="external_idp">External IdP (Enterprise SSO)</option>
               </select>
             </div>
 
@@ -317,6 +348,120 @@ export function AddCredentialDialog({
                     disabled={isPending}
                   />
                 </div>
+              </>
+            )}
+
+            {/* External IdP 额外字段（Microsoft Entra ID 等 Kiro Enterprise SSO） */}
+            {isExternalIdp && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="tokenEndpoint" className="text-sm font-medium">
+                    Token Endpoint {!isEdit && <span className="text-red-500">*</span>}
+                  </label>
+                  <Input
+                    id="tokenEndpoint"
+                    placeholder={placeholder('https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token')}
+                    value={form.tokenEndpoint}
+                    onChange={(e) => set('tokenEndpoint', e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="clientId" className="text-sm font-medium">
+                    Client ID {!isEdit && <span className="text-red-500">*</span>}
+                  </label>
+                  <Input
+                    id="clientId"
+                    placeholder={placeholder('Microsoft Entra ID 注册的 App Client ID')}
+                    value={form.clientId}
+                    onChange={(e) => set('clientId', e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="clientSecret" className="text-sm font-medium">
+                    Client Secret
+                  </label>
+                  <Input
+                    id="clientSecret"
+                    type="password"
+                    placeholder={placeholder('public client 留空(桌面/SPA 不需要)')}
+                    value={form.clientSecret}
+                    onChange={(e) => set('clientSecret', e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="scopes" className="text-sm font-medium">
+                    Scopes
+                  </label>
+                  <Input
+                    id="scopes"
+                    placeholder={placeholder('空格分隔,需含 offline_access 才能拿 rotating refresh_token')}
+                    value={form.scopes}
+                    onChange={(e) => set('scopes', e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="profileArn" className="text-sm font-medium">
+                    Profile ARN
+                  </label>
+                  <Input
+                    id="profileArn"
+                    placeholder={placeholder('arn:aws:codewhisperer:us-east-1:<acct>:profile/<id>(余额查询必需)')}
+                    value={form.profileArn}
+                    onChange={(e) => set('profileArn', e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    缺 profileArn 时 getUsageLimits 会返回 403 User is not authorized
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="issuerUrl" className="text-sm font-medium">
+                    Issuer URL
+                  </label>
+                  <Input
+                    id="issuerUrl"
+                    placeholder={placeholder('仅记录/审计用,刷新流程不读取')}
+                    value={form.issuerUrl}
+                    onChange={(e) => set('issuerUrl', e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                {!isEdit && (
+                  <>
+                    <div className="space-y-2">
+                      <label htmlFor="accessToken" className="text-sm font-medium">
+                        Access Token (可选)
+                      </label>
+                      <Input
+                        id="accessToken"
+                        type="password"
+                        placeholder="带且未过期会触发导入短路,跳过初次刷新,不烧 rotating refresh_token"
+                        value={form.accessToken}
+                        onChange={(e) => set('accessToken', e.target.value)}
+                        disabled={isPending}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label htmlFor="expiresAt" className="text-sm font-medium">
+                        Expires At (可选)
+                      </label>
+                      <Input
+                        id="expiresAt"
+                        placeholder="RFC3339 如 2026-12-31T00:00:00Z,或 Unix 毫秒数字"
+                        value={form.expiresAt}
+                        onChange={(e) => set('expiresAt', e.target.value)}
+                        disabled={isPending}
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        需与 Access Token 同时填写才生效,过期会自动忽略
+                      </p>
+                    </div>
+                  </>
+                )}
               </>
             )}
 
