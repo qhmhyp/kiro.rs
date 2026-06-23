@@ -405,17 +405,18 @@ export function AddCredentialDialog({
                 </div>
                 <div className="space-y-2">
                   <label htmlFor="profileArn" className="text-sm font-medium">
-                    Profile ARN
+                    Profile ARN (可选)
                   </label>
                   <Input
                     id="profileArn"
-                    placeholder={placeholder('arn:aws:codewhisperer:us-east-1:<acct>:profile/<id>(余额查询必需)')}
+                    placeholder={placeholder('留空则自动调 ListAvailableProfiles 解析')}
                     value={form.profileArn}
                     onChange={(e) => set('profileArn', e.target.value)}
                     disabled={isPending}
                   />
                   <p className="text-xs text-muted-foreground">
-                    缺 profileArn 时 getUsageLimits 会返回 403 User is not authorized
+                    Microsoft Entra ID 等 IdP 颁发的 JWT 不含 profileArn,留空时后端会自动调用
+                    Kiro 控制面 ListAvailableProfiles 解析并回填
                   </p>
                 </div>
                 <div className="space-y-2">

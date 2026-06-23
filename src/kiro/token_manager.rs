@@ -499,6 +499,81 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
+/// 调用 Kiro 控制面 `ListAvailableProfiles`,返回当前账号绑定的 profileArn(若存在多个取首个)。
+///
+/// 用途:External IdP 凭据导入时往往不含 profileArn(Microsoft Entra ID 颁发的 JWT 里没有此信息),
+/// 而 `getUsageLimits` / `generateAssistantResponse` 又必需 profileArn,否则后端返回
+/// `403 User is not authorized`。调用此函数从 `management.{region}.kiro.dev/ListAvailableProfiles`
+/// 自动解析,免去用户手工填写。
+///
+/// 端点契约同 `kiro-go-plus` 的 `listAvailableProfiles`:
+/// - `POST https://management.{region}.kiro.dev/ListAvailableProfiles`
+/// - Body: `{"maxResults":10}`
+/// - Bearer access_token + `tokentype: EXTERNAL_IDP`(对 external_idp 凭据)
+/// - 响应: `{"profiles":[{"arn":"..."}]}`
+///
+/// 返回 `Ok(None)` 表示账号下没有任何 profile(账户配置异常,非本地错误);
+/// 返回 `Err` 表示传输或 4xx/5xx 错误,调用方决定是否禁用凭据。
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    tracing::debug!("正在调用 ListAvailableProfiles 自动解析 profileArn...");
+
+    let region = credentials.effective_api_region(config);
+    let host = format!("management.{}.kiro.dev", region);
+    let url = format!("https://{}/ListAvailableProfiles", host);
+
+    let client = build_client(proxy, 30, config.tls_backend)?;
+    let mut request = client
+        .post(&url)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "aws-sdk-js/1.0.0 KiroIDE")
+        .header("x-amz-user-agent", "aws-sdk-js/1.0.0 KiroIDE")
+        .header("x-amzn-codewhisperer-optout", "true")
+        .header("host", &host)
+        .header("Connection", "close")
+        .body(r#"{"maxResults":10}"#);
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    } else if credentials.is_external_idp_credential() {
+        request = request.header("tokentype", "EXTERNAL_IDP");
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!(
+            "ListAvailableProfiles 失败: HTTP {} {}",
+            status,
+            body_text
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ProfileEntry {
+        arn: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ListProfilesResponse {
+        #[serde(default)]
+        profiles: Vec<ProfileEntry>,
+    }
+
+    let data: ListProfilesResponse = response.json().await?;
+    Ok(data
+        .profiles
+        .into_iter()
+        .filter_map(|p| p.arn)
+        .find(|a| !a.trim().is_empty()))
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -856,6 +931,26 @@ impl MultiTokenManager {
                     );
                     entry.disabled = true;
                     entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+                    continue;
+                }
+                // profileArn 缺失:启动加载阶段不主动 fetch(避免网络阻塞),只 warn 提示。
+                // 凭据本身仍可用于推理(数据面请求会 inject profileArn 到 body,缺了会被
+                // codewhisperer 拒成 403),建议通过 admin API PATCH 补填,或重新走 add_credential
+                // 流程触发自动 ListAvailableProfiles 解析。
+                if entry
+                    .credentials
+                    .profile_arn
+                    .as_deref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    tracing::warn!(
+                        "凭据 #{} (external_idp) 缺 profileArn,数据面请求会被后端拒成 403。\
+                         请通过 PATCH /api/admin/credentials/{} 设置 profileArn 字段,\
+                         或在 admin UI 编辑此凭据填入 ARN 后保存",
+                        entry.id,
+                        entry.id
+                    );
                 }
             }
         }
@@ -2335,6 +2430,55 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+
+        // External IdP 自动解析 profileArn:Microsoft Entra ID 等 IdP 颁发的 JWT 不含 profileArn,
+        // 而 getUsageLimits/generateAssistantResponse 又必需它,缺了会被 codewhisperer 后端拒成
+        // 403 User is not authorized。这里在 access_token 就绪后,自动调 ListAvailableProfiles
+        // 解析并回填,免去用户手填。失败仅 warn,凭据照样落库(后续可通过 PATCH 手动设置)。
+        if validated_cred.is_external_idp_credential()
+            && validated_cred
+                .profile_arn
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+        {
+            if let Some(token) = validated_cred.access_token.clone() {
+                let effective_proxy = validated_cred.effective_proxy(self.proxy.as_ref());
+                match list_available_profiles(
+                    &validated_cred,
+                    &self.config,
+                    &token,
+                    effective_proxy.as_ref(),
+                )
+                .await
+                {
+                    Ok(Some(arn)) => {
+                        tracing::info!(
+                            "External IdP 凭据自动解析 profileArn: {}",
+                            arn
+                        );
+                        validated_cred.profile_arn = Some(arn);
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "External IdP 凭据 ListAvailableProfiles 返回空列表,\
+                             profileArn 仍缺失,后续 getUsageLimits 会返回 403"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "External IdP 凭据 ListAvailableProfiles 失败({}),\
+                             profileArn 仍缺失,后续 getUsageLimits 会返回 403",
+                            e
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "External IdP 凭据缺 access_token 且未带 profileArn,无法自动解析"
+                );
+            }
+        }
 
         {
             let mut entries = self.entries.lock();
