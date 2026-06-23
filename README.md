@@ -216,6 +216,7 @@ docker-compose up
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
+| `rateLimitCooldownSecs` | number | `30` | 普通 429 累计 5 次触发的凭据冷却时长(秒)。改短让客户端可感的不可用窗口缩短;改长可减少双凭据级联乒乓。风控 429(suspicious activity)不受此影响,固定 600s |
 
 完整配置示例：
 

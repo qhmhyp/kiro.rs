@@ -102,6 +102,14 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 普通 429 触发的冷却时长(秒)。默认 30 秒。
+    ///
+    /// memory 观察:60 秒冷却会跟双凭据级联形成乒乓节奏(60s 冷却→60s 期满→再触发)。
+    /// 改短可让客户端可感的不可用窗口缩短;改长可减少 thrashing。
+    /// 风控类 429(suspicious activity)不受此影响,固定 10 分钟。
+    #[serde(default = "default_rate_limit_cooldown_secs")]
+    pub rate_limit_cooldown_secs: u64,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -161,6 +169,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_rate_limit_cooldown_secs() -> u64 {
+    30
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -189,6 +201,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
+            rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
             endpoints: HashMap::new(),
             pricing: None,
             config_path: None,

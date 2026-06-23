@@ -502,7 +502,8 @@ impl KiroProvider {
                 } else {
                     let should_cooldown = self.token_manager.increment_429_count(ctx.id);
                     if should_cooldown {
-                        let cooldown = Duration::from_secs(60);
+                        let cooldown =
+                            Duration::from_secs(self.token_manager.config().rate_limit_cooldown_secs);
                         let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
                         if !has_available {
                             return Err(self.upstream_error_for(Some(429), &body, ctx.id)
@@ -760,7 +761,8 @@ impl KiroProvider {
                     // 不切换凭据——保留 prompt cache 命中,避免切换引发级联。
                     let should_cooldown = self.token_manager.increment_429_count(ctx.id);
                     if should_cooldown {
-                        let cooldown = Duration::from_secs(60);
+                        let cooldown =
+                            Duration::from_secs(self.token_manager.config().rate_limit_cooldown_secs);
                         self.token_manager.log_rate_limit_incident(
                             ctx.id,
                             "429_transient",
