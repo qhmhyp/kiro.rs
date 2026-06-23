@@ -221,14 +221,55 @@ impl AdminService {
             }
         }
 
+        // 校验 External IdP 凭据完整性：tokenEndpoint + clientId + refreshToken 必填
+        let is_external_idp = {
+            let m = req.auth_method.as_str();
+            m.eq_ignore_ascii_case("external_idp")
+                || m.eq_ignore_ascii_case("externalidp")
+                || m.eq_ignore_ascii_case("external-idp")
+        };
+        if is_external_idp {
+            if req.token_endpoint.as_deref().unwrap_or("").is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "authMethod=external_idp 必须提供 tokenEndpoint".to_string(),
+                ));
+            }
+            if req.client_id.as_deref().unwrap_or("").is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "authMethod=external_idp 必须提供 clientId".to_string(),
+                ));
+            }
+            if req.refresh_token.as_deref().unwrap_or("").is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "authMethod=external_idp 必须提供 refreshToken".to_string(),
+                ));
+            }
+        }
+
         // 构建凭据对象
         let email = req.email.clone();
+        // 导入短路：携带未过期的 access_token 时跳过初始刷新，避免烧掉 rotating refresh_token。
+        // 非法或已过期 expires_at 不带 access_token，让 token_manager 立即走刷新流程。
+        let normalized_expires_at = req.expires_at.as_ref().and_then(|e| e.to_rfc3339());
+        let (carry_access_token, carry_expires_at) = match (&req.access_token, &normalized_expires_at) {
+            (Some(at), Some(ea)) if !at.is_empty() => {
+                let still_valid = chrono::DateTime::parse_from_rfc3339(ea)
+                    .map(|dt| dt > chrono::Utc::now() + chrono::Duration::minutes(5))
+                    .unwrap_or(false);
+                if still_valid {
+                    (Some(at.clone()), Some(ea.clone()))
+                } else {
+                    (None, None)
+                }
+            }
+            _ => (None, None),
+        };
         let new_cred = KiroCredentials {
             id: None,
-            access_token: None,
+            access_token: carry_access_token,
             refresh_token: req.refresh_token,
             profile_arn: None,
-            expires_at: None,
+            expires_at: carry_expires_at,
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
@@ -245,6 +286,9 @@ impl AdminService {
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
             endpoint: req.endpoint,
         };
 
@@ -413,6 +457,8 @@ impl AdminService {
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
             || msg.contains("凭证已过期或无效")
+            || msg.contains("refreshToken 已失效")
+            || msg.contains("invalid_grant")
             || msg.contains("权限不足")
             || msg.contains("已被限流");
 
@@ -475,6 +521,9 @@ impl AdminService {
             proxy_password: req.proxy_password,
             endpoint: req.endpoint,
             priority: req.priority,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
         };
 
         self.token_manager

@@ -23,7 +23,8 @@ use crate::kiro::incident_log::{self, IncidentRecord};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -77,7 +78,13 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
         bail!("refreshToken 为空");
     }
 
-    if refresh_token.len() < 100 || refresh_token.ends_with("...") || refresh_token.contains("...")
+    // 长度 < 100 的"截断保护"只对 Kiro IDE 自家 refresh_token 适用（social/idc 都是 JWT 等长字符串）。
+    // External IdP（Microsoft Entra ID 等）颁发的 refresh_token 长度由各 IdP 决定，不应套这个阈值。
+    let skip_truncation_check = credentials.is_external_idp_credential();
+    if !skip_truncation_check
+        && (refresh_token.len() < 100
+            || refresh_token.ends_with("...")
+            || refresh_token.contains("..."))
     {
         bail!(
             "refreshToken 已被截断（长度: {} 字符）。\n\
@@ -136,6 +143,11 @@ pub(crate) async fn refresh_token(
         || auth_method.eq_ignore_ascii_case("iam")
     {
         refresh_idc_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("external_idp")
+        || auth_method.eq_ignore_ascii_case("externalidp")
+        || auth_method.eq_ignore_ascii_case("external-idp")
+    {
+        refresh_external_idp_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
     }
@@ -322,6 +334,96 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 刷新 External IdP Token (Microsoft Entra ID / 通用 OAuth2 IdP)
+///
+/// 直接向凭据自带的 `token_endpoint` 走标准 OAuth2 `refresh_token` grant。
+/// `client_secret` 非空时按 confidential client 发送，否则按 public client（不传该字段）。
+/// `scopes` 非空时透传到 `scope` 表单字段；含 `offline_access` 才能拿到 rotating refresh_token。
+///
+/// 响应里的 `refresh_token` 是 rotating 的，必须回写，否则下次刷新会用废 token 失败。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    _config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
+
+    let client = build_client(proxy, 60, _config.tls_backend)?;
+
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id.as_str()),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    if let Some(scopes) = credentials.scopes.as_deref() {
+        if !scopes.is_empty() {
+            form.push(("scope", scopes));
+        }
+    }
+    if let Some(secret) = credentials.client_secret.as_deref() {
+        if !secret.is_empty() {
+            form.push(("client_secret", secret));
+        }
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .header("Connection", "close")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+
+        // OAuth2 标准 invalid_grant → refresh_token 永久失效
+        if status.as_u16() == 400 && body_text.contains("\"invalid_grant\"") {
+            return Err(RefreshTokenInvalidError {
+                message: format!("External IdP refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            400 => "External IdP 请求参数错误",
+            401 => "External IdP 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，External IdP token endpoint 暂时不可用",
+            _ => "External IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -374,6 +476,8 @@ pub(crate) async fn get_usage_limits(
 
     if credentials.is_api_key_credential() {
         request = request.header("tokentype", "API_KEY");
+    } else if credentials.is_external_idp_credential() {
+        request = request.header("tokentype", "EXTERNAL_IDP");
     }
 
     let response = request.send().await?;
@@ -468,6 +572,9 @@ pub struct CredentialUpdate {
     pub proxy_password: Option<String>,
     pub endpoint: Option<String>,
     pub priority: Option<u32>,
+    pub token_endpoint: Option<String>,
+    pub issuer_url: Option<String>,
+    pub scopes: Option<String>,
 }
 
 /// 禁用原因
@@ -733,6 +840,23 @@ impl MultiTokenManager {
                 );
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+            }
+        }
+
+        // 校验 External IdP 凭据配置完整性：必须提供 tokenEndpoint + clientId + refreshToken
+        for entry in &mut entries {
+            if entry.credentials.is_external_idp_credential() {
+                let missing = entry.credentials.token_endpoint.is_none()
+                    || entry.credentials.client_id.is_none()
+                    || entry.credentials.refresh_token.is_none();
+                if missing {
+                    tracing::warn!(
+                        "凭据 #{} 配置了 authMethod=external_idp 但缺少 tokenEndpoint/clientId/refreshToken 之一，已自动禁用",
+                        entry.id
+                    );
+                    entry.disabled = true;
+                    entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+                }
             }
         }
 
@@ -1938,6 +2062,15 @@ impl MultiTokenManager {
             apply(&mut c.proxy_password, &update.proxy_password);
             apply(&mut c.endpoint, &update.endpoint);
 
+            // External IdP 鉴权字段：改 token_endpoint / scopes 等同改鉴权配置，
+            // 触发下次请求重新刷新（旧 access_token 不再有效）
+            if update.token_endpoint.is_some() || update.scopes.is_some() {
+                invalidate_token = true;
+            }
+            apply(&mut c.token_endpoint, &update.token_endpoint);
+            apply(&mut c.issuer_url, &update.issuer_url);
+            apply(&mut c.scopes, &update.scopes);
+
             if let Some(p) = update.priority {
                 c.priority = p;
             }
@@ -2160,7 +2293,15 @@ impl MultiTokenManager {
         }
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
+        //    External IdP 导入短路：携带未过期的 access_token 时跳过初始刷新，
+        //    避免烧掉 single-use rotating refresh_token（Microsoft Entra ID 等）。
         let mut validated_cred = if new_cred.is_api_key_credential() {
+            new_cred.clone()
+        } else if new_cred.is_external_idp_credential()
+            && new_cred.access_token.is_some()
+            && !is_token_expired(&new_cred)
+        {
+            tracing::info!("External IdP 凭据导入短路：携带未过期 access_token，跳过初始刷新");
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
@@ -2372,6 +2513,26 @@ mod tests {
     fn test_validate_refresh_token_valid() {
         let mut credentials = KiroCredentials::default();
         credentials.refresh_token = Some("a".repeat(150));
+        let result = validate_refresh_token(&credentials);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_refresh_token_short_rejected_for_social() {
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("social".to_string());
+        credentials.refresh_token = Some("short_token".to_string());
+        let err = validate_refresh_token(&credentials).unwrap_err();
+        assert!(err.to_string().contains("已被截断"));
+    }
+
+    #[test]
+    fn test_validate_refresh_token_short_accepted_for_external_idp() {
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("external_idp".to_string());
+        // Microsoft refresh token 实际很长，但其它 IdP 可能短于 100。
+        // 这里用很短的 token 验证 external_idp 跳过 Kiro IDE 自家的截断检测。
+        credentials.refresh_token = Some("short_token_42_chars_should_not_be_truncated".to_string());
         let result = validate_refresh_token(&credentials);
         assert!(result.is_ok());
     }
@@ -2590,6 +2751,81 @@ mod tests {
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_multi_token_manager_external_idp_missing_fields_auto_disabled() {
+        let config = Config::default();
+
+        let full = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("ms-refresh".to_string()),
+            client_id: Some("dab27a3f-8718-4db2-86cc-29fdd5bbaab7".to_string()),
+            token_endpoint: Some(
+                "https://login.microsoftonline.com/tid/oauth2/v2.0/token".to_string(),
+            ),
+            ..KiroCredentials::default()
+        };
+        let missing_te = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("x".to_string()),
+            client_id: Some("cid".to_string()),
+            ..KiroCredentials::default()
+        };
+        let missing_cid = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("x".to_string()),
+            token_endpoint: Some("https://idp/token".to_string()),
+            ..KiroCredentials::default()
+        };
+        let missing_rt = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            client_id: Some("cid".to_string()),
+            token_endpoint: Some("https://idp/token".to_string()),
+            ..KiroCredentials::default()
+        };
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![full, missing_te, missing_cid, missing_rt],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(manager.total_count(), 4);
+        // 只有 full 可用，3 个不完整的被自动禁用
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_external_idp_refresh_response_deserializes_snake_case() {
+        // Microsoft Entra ID 返回 snake_case 字段
+        let json = r#"{
+            "token_type": "Bearer",
+            "scope": "api://x/codewhisperer:conversations",
+            "expires_in": 5057,
+            "ext_expires_in": 5057,
+            "access_token": "eyJ.new.access",
+            "refresh_token": "1.new-refresh-token"
+        }"#;
+        let parsed: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.access_token, "eyJ.new.access");
+        assert_eq!(parsed.refresh_token.as_deref(), Some("1.new-refresh-token"));
+        assert_eq!(parsed.expires_in, Some(5057));
+    }
+
+    #[test]
+    fn test_external_idp_refresh_response_handles_missing_refresh_token() {
+        // 非 rotating 模式（scope 没带 offline_access）时上游可能不回 refresh_token
+        let json = r#"{
+            "access_token": "eyJ.x",
+            "expires_in": 3600
+        }"#;
+        let parsed: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.access_token, "eyJ.x");
+        assert!(parsed.refresh_token.is_none());
+        assert_eq!(parsed.expires_in, Some(3600));
     }
 
     #[test]

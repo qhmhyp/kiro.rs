@@ -132,6 +132,12 @@ pub struct UpdateCredentialRequest {
     pub proxy_password: Option<String>,
     pub endpoint: Option<String>,
     pub priority: Option<u32>,
+    /// External IdP token endpoint（authMethod=external_idp 必填）
+    pub token_endpoint: Option<String>,
+    /// External IdP issuer URL（可选，仅记录用）
+    pub issuer_url: Option<String>,
+    /// External IdP scopes（空格分隔，含 offline_access 才能拿到 rotating refresh_token）
+    pub scopes: Option<String>,
 }
 
 /// 修改优先级请求
@@ -194,9 +200,54 @@ pub struct AddCredentialRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
+    /// External IdP token endpoint（authMethod=external_idp 必填）
+    ///
+    /// 标准 OAuth2 refresh_token grant 的 token endpoint URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// External IdP issuer URL（可选，仅记录/审计用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// External IdP scopes（空格分隔；含 offline_access 才能拿到 rotating refresh_token）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
+    /// 导入短路：若提供且 expiresAt 未到期，则跳过初始刷新，避免烧掉 rotating refresh_token
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+
+    /// 导入短路：RFC3339 字符串或 Unix 毫秒(数字),与 accessToken 配合使用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<ExpiresAt>,
+
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+}
+
+/// 兼容字符串(RFC3339)和数字(Unix 毫秒)两种 expiresAt 表示
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ExpiresAt {
+    Rfc3339(String),
+    UnixMillis(i64),
+}
+
+impl ExpiresAt {
+    /// 归一化为 RFC3339 字符串；非法值返回 None
+    pub fn to_rfc3339(&self) -> Option<String> {
+        match self {
+            ExpiresAt::Rfc3339(s) => {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
+            }
+            ExpiresAt::UnixMillis(ms) => chrono::DateTime::<chrono::Utc>::from_timestamp_millis(*ms)
+                .map(|dt| dt.to_rfc3339()),
+        }
+    }
 }
 
 fn default_auth_method() -> String {
@@ -297,5 +348,48 @@ impl AdminErrorResponse {
 
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expires_at_rfc3339() {
+        let e = ExpiresAt::Rfc3339("2026-06-23T04:24:06Z".to_string());
+        let normalized = e.to_rfc3339().unwrap();
+        assert!(normalized.starts_with("2026-06-23T04:24:06"));
+    }
+
+    #[test]
+    fn test_expires_at_rfc3339_with_offset_normalizes_to_utc() {
+        let e = ExpiresAt::Rfc3339("2026-06-23T06:24:06+02:00".to_string());
+        let normalized = e.to_rfc3339().unwrap();
+        assert!(normalized.starts_with("2026-06-23T04:24:06"));
+    }
+
+    #[test]
+    fn test_expires_at_unix_millis() {
+        let e = ExpiresAt::UnixMillis(1_782_189_121_000);
+        let normalized = e.to_rfc3339().unwrap();
+        assert!(normalized.starts_with("2026-06-23T04:32:01"));
+    }
+
+    #[test]
+    fn test_expires_at_invalid_rfc3339_returns_none() {
+        let e = ExpiresAt::Rfc3339("not a date".to_string());
+        assert!(e.to_rfc3339().is_none());
+    }
+
+    #[test]
+    fn test_add_credential_request_parses_both_expires_at_forms() {
+        let json_string = r#"{"refreshToken":"r","authMethod":"external_idp","expiresAt":"2026-06-23T04:24:06Z"}"#;
+        let req: AddCredentialRequest = serde_json::from_str(json_string).unwrap();
+        assert!(matches!(req.expires_at, Some(ExpiresAt::Rfc3339(_))));
+
+        let json_num = r#"{"refreshToken":"r","authMethod":"external_idp","expiresAt":1782189121000}"#;
+        let req: AddCredentialRequest = serde_json::from_str(json_num).unwrap();
+        assert!(matches!(req.expires_at, Some(ExpiresAt::UnixMillis(_))));
     }
 }

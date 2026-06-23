@@ -107,6 +107,23 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
+    /// External IdP token endpoint（authMethod=external_idp 必填）
+    ///
+    /// 标准 OAuth2 refresh_token grant 的 token endpoint URL，
+    /// 例如 `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// External IdP issuer URL（可选，仅记录/审计用，刷新流程不读取）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// External IdP scopes（空格分隔字符串）
+    ///
+    /// 刷新时透传到 `scope` 表单字段；必须包含 `offline_access` 才会颁发 rotating refresh_token
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
     /// 端点名称（可选）
     ///
     /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
@@ -125,6 +142,11 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
+    } else if value.eq_ignore_ascii_case("external_idp")
+        || value.eq_ignore_ascii_case("externalidp")
+        || value.eq_ignore_ascii_case("external-idp")
+    {
+        "external_idp"
     } else {
         value
     }
@@ -276,6 +298,21 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    /// 检查是否为 External IdP 凭据
+    ///
+    /// External IdP 凭据通过自带的 `token_endpoint` 走标准 OAuth2 refresh_token grant，
+    /// 数据面请求必须附加 `TokenType: EXTERNAL_IDP` header 后端才会按 external_idp 校验 JWT。
+    pub fn is_external_idp_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| {
+                m.eq_ignore_ascii_case("external_idp")
+                    || m.eq_ignore_ascii_case("externalidp")
+                    || m.eq_ignore_ascii_case("external-idp")
+            })
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +384,9 @@ mod tests {
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             endpoint: None,
         };
 
@@ -466,6 +506,9 @@ mod tests {
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             endpoint: None,
         };
 
@@ -498,6 +541,9 @@ mod tests {
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             endpoint: None,
         };
 
@@ -613,6 +659,9 @@ mod tests {
             proxy_password: None,
             disabled: false,
             kiro_api_key: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             endpoint: None,
         };
 
@@ -877,5 +926,85 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    // ---- External IdP ----
+
+    #[test]
+    fn test_external_idp_fields_round_trip() {
+        let json = r#"{
+            "refreshToken": "ms-refresh",
+            "accessToken": "ms-access",
+            "expiresAt": "2026-12-31T00:00:00Z",
+            "authMethod": "external_idp",
+            "clientId": "dab27a3f-8718-4db2-86cc-29fdd5bbaab7",
+            "clientSecret": "",
+            "tokenEndpoint": "https://login.microsoftonline.com/tid/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/tid/v2.0",
+            "scopes": "api://x/codewhisperer:conversations offline_access",
+            "region": "us-east-1",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X"
+        }"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tid/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tid/v2.0")
+        );
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some("api://x/codewhisperer:conversations offline_access")
+        );
+        assert_eq!(creds.client_secret.as_deref(), Some(""));
+
+        let serialized = creds.to_pretty_json().unwrap();
+        assert!(serialized.contains("\"tokenEndpoint\""));
+        assert!(serialized.contains("\"issuerUrl\""));
+        assert!(serialized.contains("\"scopes\""));
+    }
+
+    #[test]
+    fn test_external_idp_optional_fields_skipped_when_absent() {
+        let creds = KiroCredentials::default();
+        let json = creds.to_pretty_json().unwrap();
+        assert!(!json.contains("tokenEndpoint"));
+        assert!(!json.contains("issuerUrl"));
+        assert!(!json.contains("scopes"));
+    }
+
+    #[test]
+    fn test_canonicalize_external_idp_variants() {
+        for variant in ["ExternalIdp", "externalIdp", "external-idp", "EXTERNAL_IDP"] {
+            let mut creds = KiroCredentials {
+                auth_method: Some(variant.to_string()),
+                ..KiroCredentials::default()
+            };
+            creds.canonicalize_auth_method();
+            assert_eq!(
+                creds.auth_method.as_deref(),
+                Some("external_idp"),
+                "variant {} did not canonicalize",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_external_idp_credential() {
+        let mut creds = KiroCredentials::default();
+        assert!(!creds.is_external_idp_credential());
+
+        creds.auth_method = Some("external_idp".to_string());
+        assert!(creds.is_external_idp_credential());
+
+        creds.auth_method = Some("ExternalIdp".to_string());
+        assert!(creds.is_external_idp_credential());
+
+        creds.auth_method = Some("idc".to_string());
+        assert!(!creds.is_external_idp_credential());
     }
 }
