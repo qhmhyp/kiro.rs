@@ -82,6 +82,7 @@ Complete all chunked operations without commentary.";
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - opus 4.7/4-7 → claude-opus-4.7
+/// - opus 4.8/4-8 → claude-opus-4.8
 /// - 其他 opus → claude-opus-4.6（宽松兜底）
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
@@ -98,6 +99,8 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
+            Some("claude-opus-4.8".to_string())
         } else {
             // 宽松兜底：未识别小版本的 opus 仍映射到 4.6，保持兼容
             Some("claude-opus-4.6".to_string())
@@ -112,13 +115,14 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。Opus 4.7 同为 1M。
+/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。Opus 4.7/4.8 同为 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7" =>
+                || mapped == "claude-opus-4.7"
+                || mapped == "claude-opus-4.8" =>
         {
             1_000_000
         }
@@ -1011,6 +1015,28 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_opus_4_8() {
+        // opus 4.8（含连字符与点号写法）应映射到 claude-opus-4.8
+        assert_eq!(
+            map_model("claude-opus-4-8"),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4.8"),
+            Some("claude-opus-4.8".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_opus_4_8() {
+        // thinking 后缀不应影响 opus 4.8 模型映射
+        assert_eq!(
+            map_model("claude-opus-4-8-thinking"),
+            Some("claude-opus-4.8".to_string())
+        );
+    }
+
+    #[test]
     fn test_context_window_opus_4_7_is_1m() {
         // Opus 4.7 与 4.6/sonnet 4.6 一样是 1M 上下文
         assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
@@ -1019,6 +1045,14 @@ mod tests {
         assert_eq!(get_context_window_size("claude-opus-4-6"), 1_000_000);
         // 4.5 仍是 200k
         assert_eq!(get_context_window_size("claude-opus-4-5-20251101"), 200_000);
+    }
+
+    #[test]
+    fn test_context_window_opus_4_8_is_1m() {
+        // Opus 4.8 经实测同为 1M 上下文（contextUsageEvent 13.14% @ 131K tokens）
+        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4-8-thinking"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4.8"), 1_000_000);
     }
 
     #[test]

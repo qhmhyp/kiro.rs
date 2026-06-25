@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request, map_model};
 use super::middleware::AppState;
 use super::prefix_cache::ConvoTokenCache;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -157,6 +157,24 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = vec![
+        Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1782518400, // Jun 25, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1782518400, // Jun 25, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
@@ -782,21 +800,22 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6 / 4.7：覆写为 adaptive 类型 + OutputConfig{effort:"high"}
+/// - Opus 4.6 / 4.7 / 4.8：覆写为 adaptive 类型 + OutputConfig{effort:"high"}
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
+    if !payload.model.to_lowercase().contains("thinking") {
         return;
     }
 
-    // Opus 4.6 起引入 adaptive thinking，4.7 同系列沿用同一处理
-    let is_opus_adaptive = model_lower.contains("opus")
-        && (model_lower.contains("4-6")
-            || model_lower.contains("4.6")
-            || model_lower.contains("4-7")
-            || model_lower.contains("4.7"));
+    // Opus 4.6 起引入 adaptive thinking，4.7/4.8 同系列沿用同一处理。
+    // 派生自 map_model 的输出，确保与请求实际落地的上游模型一致：
+    // 避免如 `claude-opus-4-5-rev-4-8-thinking` 这种 map_model 命中 4.5
+    // 但本处又命中 "4-8" 子串导致 adaptive 与 4.5 不兼容的差异 bug。
+    let is_opus_adaptive = matches!(
+        map_model(&payload.model).as_deref(),
+        Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8")
+    );
 
     let thinking_type = if is_opus_adaptive {
         "adaptive"
@@ -1303,6 +1322,15 @@ mod tests {
     }
 
     #[test]
+    fn thinking_override_opus_4_8_uses_adaptive() {
+        // Opus 4.8-thinking 经实测：上游接受 adaptive + effort:high，与 4.6/4.7 一致
+        let mut p = req_with_model("claude-opus-4-8-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "adaptive");
+        assert_eq!(p.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
     fn thinking_override_opus_4_6_still_adaptive() {
         // 回归：4.6 行为不变
         let mut p = req_with_model("claude-opus-4-6-thinking");
@@ -1324,6 +1352,17 @@ mod tests {
         let mut p = req_with_model("claude-opus-4-7");
         override_thinking_from_model_name(&mut p);
         assert!(p.thinking.is_none());
+        assert!(p.output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_override_follows_map_model_precedence_not_substring() {
+        // 回归：模型名同时含 "4-5" 和 "4-8" 时，map_model 短路在 4-5（返回 claude-opus-4.5），
+        // 本处应跟随 map_model 的判定走 enabled（4.5 不支持 adaptive），而不是因含 "4-8"
+        // 误判为 adaptive 导致上游 400。
+        let mut p = req_with_model("claude-opus-4-5-rev-4-8-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "enabled");
         assert!(p.output_config.is_none());
     }
 }
