@@ -102,10 +102,12 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
-    /// 普通 429 触发的冷却时长(秒)。默认 30 秒。
+    /// 普通 429 触发的冷却时长(秒)。默认 8 秒。
     ///
-    /// memory 观察:60 秒冷却会跟双凭据级联形成乒乓节奏(60s 冷却→60s 期满→再触发)。
-    /// 改短可让客户端可感的不可用窗口缩短;改长可减少 thrashing。
+    /// 实测数据:Kiro 上游真实 throttle 是凭据级短期窗口,触发后 ~5s 同模型恢复 200,
+    /// 跨模型 1.3s 内同步 throttle 之后 ~4-7s 恢复,完整恢复 ~10-15s。所以默认 8s
+    /// 覆盖约 70-80% 的真实窗口,与"连续 5 次累计才升级"配合,客户端可感的不可用
+    /// 窗口压到 ~8s 级。改短(<5s)风险:立刻又被 throttle;改长(>30s)收益甚低。
     /// 风控类 429(suspicious activity)不受此影响,固定 10 分钟。
     #[serde(default = "default_rate_limit_cooldown_secs")]
     pub rate_limit_cooldown_secs: u64,
@@ -170,7 +172,7 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_rate_limit_cooldown_secs() -> u64 {
-    30
+    8
 }
 
 fn default_endpoint() -> String {
