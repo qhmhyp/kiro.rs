@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request, map_model};
 use super::middleware::AppState;
 use super::prefix_cache::ConvoTokenCache;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -31,14 +31,13 @@ use super::websearch;
 
 /// 上游错误到 HTTP 响应的纯映射（可单测，不涉及 axum Response 类型）
 ///
-/// 返回 (http_status, error_type, body_message, optional_response_headers)
+/// 返回 HTTP 状态码、错误类型、对外通用 message 及响应头所需字段（上游诊断细节只进日志）
 struct UpstreamMapping {
     status: StatusCode,
     error_type: &'static str,
     message: String,
     upstream_status: Option<u16>,
     credential_id: u64,
-    body_preview: String,
     add_retry_after: bool,
 }
 
@@ -48,7 +47,7 @@ fn map_upstream_error(u: &UpstreamError) -> UpstreamMapping {
         Some(s) if (400..500).contains(&s) => {
             StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY)
         }
-        // 5xx / 网络错误：CF 会替换 body，但至少 header 还能透传
+        // 5xx / 网络错误：统一映射 502，真实状态码经 x-upstream-status header 透传
         _ => StatusCode::BAD_GATEWAY,
     };
     let error_type = match u.status {
@@ -58,44 +57,25 @@ fn map_upstream_error(u: &UpstreamError) -> UpstreamMapping {
         Some(s) if (400..500).contains(&s) => "invalid_request_error",
         _ => "api_error",
     };
-    let upstream_label = u
-        .status
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "network".to_string());
-    let exhausted = if u.all_credentials_exhausted {
-        "（所有凭据已用尽）"
-    } else {
-        ""
-    };
-    let message = format!(
-        "上游 {} 凭据 #{}{}: {}",
-        upstream_label, u.credential_id, exhausted, u.body
-    );
+    let message = public_upstream_error_message(u.status).to_string();
     UpstreamMapping {
         status,
         error_type,
         message,
         upstream_status: u.status,
         credential_id: u.credential_id,
-        body_preview: sanitize_for_header(&u.body, 300),
         add_retry_after: u.all_credentials_exhausted && status == StatusCode::TOO_MANY_REQUESTS,
     }
 }
 
-/// 保留 ASCII 可见字符（含空格），其他用 ? 替换；用于放进 HTTP header value
-///
-/// HTTP/1.1 spec 不允许 header value 含非 ASCII，axum 的 HeaderValue::from_str 会拒绝。
-fn sanitize_for_header(s: &str, max_chars: usize) -> String {
-    s.chars()
-        .map(|c| {
-            if c == ' ' || (c.is_ascii_graphic() && c != '\r' && c != '\n') {
-                c
-            } else {
-                '?'
-            }
-        })
-        .take(max_chars)
-        .collect()
+fn public_upstream_error_message(status: Option<u16>) -> &'static str {
+    match status {
+        Some(429) => "Upstream service is rate limited. Please retry later.",
+        Some(401) => "Upstream service authentication failed.",
+        Some(402) | Some(403) => "Upstream service permission denied.",
+        Some(s) if (400..500).contains(&s) => "Upstream service rejected the request.",
+        _ => "Upstream service is unavailable. Please try again later.",
+    }
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -128,8 +108,7 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
-    // 结构化上游错误：按真实状态码透传，并通过 header 携带诊断信息
-    // （前面有反代 / CF 时，5xx body 会被替换，但 header 默认透传）
+    // 结构化上游错误：按真实状态码和错误类型返回，详细诊断只写日志/内部状态。
     if let Some(u) = err
         .chain()
         .find_map(|e| e.downcast_ref::<UpstreamError>())
@@ -153,14 +132,6 @@ fn map_provider_error(err: Error) -> Response {
                 headers.insert(HeaderName::from_static("x-upstream-status"), v);
             }
         }
-        if let Ok(v) = HeaderValue::from_str(&mapping.credential_id.to_string()) {
-            headers.insert(HeaderName::from_static("x-upstream-credential"), v);
-        }
-        if !mapping.body_preview.is_empty() {
-            if let Ok(v) = HeaderValue::from_str(&mapping.body_preview) {
-                headers.insert(HeaderName::from_static("x-upstream-body"), v);
-            }
-        }
         if mapping.add_retry_after {
             headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
         }
@@ -173,7 +144,7 @@ fn map_provider_error(err: Error) -> Response {
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败: {}", err),
+            public_upstream_error_message(None),
         )),
     )
         .into_response()
@@ -186,6 +157,24 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = vec![
+        Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1782518400, // Jun 25, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1782518400, // Jun 25, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
@@ -464,7 +453,10 @@ async fn handle_stream_request(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider.call_api_stream(request_body).await {
+    let (response, credential_id, in_flight_guard) = match provider
+        .call_api_stream(request_body, Some(&conversation_id))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -478,7 +470,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, in_flight_guard);
 
     // 返回 SSE 响应
     Response::builder()
@@ -503,6 +495,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    in_flight_guard: crate::kiro::in_flight::InFlightGuard,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -587,7 +580,12 @@ fn create_sse_stream(
     )
     .flatten();
 
-    initial_stream.chain(processing_stream)
+    let combined = initial_stream.chain(processing_stream);
+    // guard 被 move 进闭包:流 drop(播完或客户端断开)时计数自动归还
+    combined.map(move |item| {
+        let _keep = &in_flight_guard;
+        item
+    })
 }
 
 use super::converter::get_context_window_size;
@@ -605,7 +603,10 @@ async fn handle_non_stream_request(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider.call_api(request_body).await {
+    let (response, credential_id, _in_flight_guard) = match provider
+        .call_api(request_body, Some(&conversation_id))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -799,21 +800,22 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6 / 4.7：覆写为 adaptive 类型 + OutputConfig{effort:"high"}
+/// - Opus 4.6 / 4.7 / 4.8：覆写为 adaptive 类型 + OutputConfig{effort:"high"}
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
+    if !payload.model.to_lowercase().contains("thinking") {
         return;
     }
 
-    // Opus 4.6 起引入 adaptive thinking，4.7 同系列沿用同一处理
-    let is_opus_adaptive = model_lower.contains("opus")
-        && (model_lower.contains("4-6")
-            || model_lower.contains("4.6")
-            || model_lower.contains("4-7")
-            || model_lower.contains("4.7"));
+    // Opus 4.6 起引入 adaptive thinking，4.7/4.8 同系列沿用同一处理。
+    // 派生自 map_model 的输出，确保与请求实际落地的上游模型一致：
+    // 避免如 `claude-opus-4-5-rev-4-8-thinking` 这种 map_model 命中 4.5
+    // 但本处又命中 "4-8" 子串导致 adaptive 与 4.5 不兼容的差异 bug。
+    let is_opus_adaptive = matches!(
+        map_model(&payload.model).as_deref(),
+        Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8")
+    );
 
     let thinking_type = if is_opus_adaptive {
         "adaptive"
@@ -1031,7 +1033,10 @@ async fn handle_stream_request_buffered(
     current_turn_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider.call_api_stream(request_body).await {
+    let (response, credential_id, in_flight_guard) = match provider
+        .call_api_stream(request_body, Some(&conversation_id))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -1042,7 +1047,7 @@ async fn handle_stream_request_buffered(
         .with_cost_sink(provider.token_manager(), credential_id);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, in_flight_guard);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1064,10 +1069,11 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    in_flight_guard: crate::kiro::in_flight::InFlightGuard,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
-    stream::unfold(
+    let inner = stream::unfold(
         (
             body_stream,
             ctx,
@@ -1142,7 +1148,12 @@ fn create_buffered_sse_stream(
             }
         },
     )
-    .flatten()
+    .flatten();
+    // guard 被 move 进闭包:流 drop(播完或客户端断开)时计数自动归还
+    inner.map(move |item| {
+        let _keep = &in_flight_guard;
+        item
+    })
 }
 
 #[cfg(test)]
@@ -1159,12 +1170,19 @@ mod tests {
 
     #[test]
     fn maps_upstream_429_to_too_many_requests() {
-        let u = err_for(Some(429), "Due to suspicious activity", false);
+        let u = err_for(
+            Some(429),
+            r#"{"message":"Due to suspicious activity","user":"f4d854a8"}"#,
+            false,
+        );
         let m = map_upstream_error(&u);
         assert_eq!(m.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(m.error_type, "rate_limit_error");
-        assert!(m.message.contains("429"));
-        assert!(m.message.contains("suspicious activity"));
+        assert_eq!(
+            m.message,
+            "Upstream service is rate limited. Please retry later."
+        );
+        assert_public_error_message_is_sanitized(&m.message);
         assert_eq!(m.upstream_status, Some(429));
         assert_eq!(m.credential_id, 4);
         assert!(!m.add_retry_after, "单次 429 不应加 Retry-After");
@@ -1176,7 +1194,8 @@ mod tests {
         let m = map_upstream_error(&u);
         assert_eq!(m.status, StatusCode::TOO_MANY_REQUESTS);
         assert!(m.add_retry_after, "全凭据冷却时应加 Retry-After");
-        assert!(m.message.contains("所有凭据已用尽"));
+        assert_public_error_message_is_sanitized(&m.message);
+        assert!(!m.message.contains("所有凭据已用尽"));
     }
 
     #[test]
@@ -1208,26 +1227,80 @@ mod tests {
         let u = err_for(None, "connection reset by peer", false);
         let m = map_upstream_error(&u);
         assert_eq!(m.status, StatusCode::BAD_GATEWAY);
-        assert!(m.message.contains("network"));
+        assert_eq!(
+            m.message,
+            "Upstream service is unavailable. Please try again later."
+        );
+        assert_public_error_message_is_sanitized(&m.message);
     }
 
-    #[test]
-    fn sanitize_for_header_strips_non_ascii_and_control_chars() {
-        let s = sanitize_for_header("hello\n中文\tworld\r行", 100);
-        assert!(!s.contains('\n'));
-        assert!(!s.contains('\t'));
-        assert!(!s.contains('\r'));
-        // ASCII 可见字符保留
-        assert!(s.contains("hello"));
-        assert!(s.contains("world"));
-        // 非 ASCII 字符变成 ?
-        assert!(s.contains('?'));
+    #[tokio::test]
+    async fn provider_error_response_does_not_expose_upstream_diagnostics() {
+        let u = err_for(
+            Some(403),
+            r#"{"message":"Your User ID (f4d854a8) temporarily is suspended","support_form":"https://app.kiro.dev/account/usage?support_form"}"#,
+            true,
+        );
+        let response = map_provider_error(u.into_anyhow());
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key("x-upstream-body"));
+        assert!(!response.headers().contains_key("x-upstream-credential"));
+        assert!(response.headers().contains_key("x-upstream-status"));
+
+        let message = response_error_message(response).await;
+        assert_eq!(message, "Upstream service permission denied.");
+        assert_public_error_message_is_sanitized(&message);
     }
 
-    #[test]
-    fn sanitize_for_header_respects_max_chars() {
-        let s = sanitize_for_header(&"a".repeat(500), 100);
-        assert_eq!(s.len(), 100);
+    #[tokio::test]
+    async fn unstructured_provider_error_response_is_generic() {
+        let err = anyhow::anyhow!("raw upstream token abc123 failed for credential #15");
+        let response = map_provider_error(err);
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key("x-upstream-body"));
+        assert!(!response.headers().contains_key("x-upstream-credential"));
+
+        let message = response_error_message(response).await;
+        assert_eq!(
+            message,
+            "Upstream service is unavailable. Please try again later."
+        );
+        assert!(!message.contains("abc123"));
+        assert!(!message.contains("credential #15"));
+    }
+
+    async fn response_error_message(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body should be JSON");
+        value["error"]["message"]
+            .as_str()
+            .expect("error.message should be a string")
+            .to_string()
+    }
+
+    fn assert_public_error_message_is_sanitized(message: &str) {
+        for leaked in [
+            "凭据",
+            "credential",
+            "所有凭据",
+            "suspicious activity",
+            "f4d854a8",
+            "support_form",
+            "Your User ID",
+            "connection reset",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "public error message leaked `{}`: {}",
+                leaked,
+                message
+            );
+        }
     }
 
     fn req_with_model(model: &str) -> MessagesRequest {
@@ -1243,6 +1316,15 @@ mod tests {
     fn thinking_override_opus_4_7_uses_adaptive() {
         // Opus 4.7-thinking 应与 4.6 一致：adaptive + OutputConfig{effort:"high"}
         let mut p = req_with_model("claude-opus-4-7-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "adaptive");
+        assert_eq!(p.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn thinking_override_opus_4_8_uses_adaptive() {
+        // Opus 4.8-thinking 经实测：上游接受 adaptive + effort:high，与 4.6/4.7 一致
+        let mut p = req_with_model("claude-opus-4-8-thinking");
         override_thinking_from_model_name(&mut p);
         assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "adaptive");
         assert_eq!(p.output_config.as_ref().unwrap().effort, "high");
@@ -1270,6 +1352,17 @@ mod tests {
         let mut p = req_with_model("claude-opus-4-7");
         override_thinking_from_model_name(&mut p);
         assert!(p.thinking.is_none());
+        assert!(p.output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_override_follows_map_model_precedence_not_substring() {
+        // 回归：模型名同时含 "4-5" 和 "4-8" 时，map_model 短路在 4-5（返回 claude-opus-4.5），
+        // 本处应跟随 map_model 的判定走 enabled（4.5 不支持 adaptive），而不是因含 "4-8"
+        // 误判为 adaptive 导致上游 400。
+        let mut p = req_with_model("claude-opus-4-5-rev-4-8-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "enabled");
         assert!(p.output_config.is_none());
     }
 }

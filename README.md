@@ -127,6 +127,30 @@ IdC 认证：
 }
 ```
 
+External IdP 认证（Kiro Enterprise SSO，以 Microsoft Entra ID 为例）：
+```json
+{
+   "refreshToken": "Microsoft 颁发的 refresh_token",
+   "accessToken": "可选；携带且未过期时跳过首次刷新，避免烧掉 rotating refresh_token",
+   "expiresAt": "2026-12-31T00:00:00Z",
+   "authMethod": "external_idp",
+   "clientId": "Kiro 在 Entra ID 注册的 App Client ID",
+   "clientSecret": "",
+   "tokenEndpoint": "https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token",
+   "issuerUrl": "https://login.microsoftonline.com/<tenant-id>/v2.0",
+   "scopes": "api://<app-id>/codewhisperer:conversations api://<app-id>/codewhisperer:completions offline_access",
+   "region": "us-east-1",
+   "profileArn": "arn:aws:codewhisperer:us-east-1:<account-id>:profile/<profile-id>"
+}
+```
+
+要点：
+- `tokenEndpoint` + `clientId` + `refreshToken` 必填；缺一启动时会被自动禁用。
+- `clientSecret` 为空字符串表示 public client（设备/桌面/SPA 应用），刷新时不发送该字段。
+- `scopes` 中必须包含 `offline_access`，否则 Microsoft 不会返回 rotating refresh_token。
+- refresh token 是 single-use rotating——每次刷新都会颁发新的 refresh token 并使旧的立即失效；本服务会自动回写。
+- 数据面请求会自动附加 `tokentype: EXTERNAL_IDP` header，Kiro 后端凭此走 External IdP 校验路径。
+
 ### 3. 启动
 
 ```bash
@@ -192,6 +216,7 @@ docker-compose up
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
+| `rateLimitCooldownSecs` | number | `8` | 普通 429 累计 5 次触发的凭据冷却时长(秒)。实测上游真实 throttle 窗口 ~10-15s,8s 覆盖大部分场景且与"5 次累计才升级"配合。低于 5s 风险快速 thrashing;高于 30s 收益甚低。风控 429(suspicious activity)不受此影响,固定 600s |
 
 完整配置示例：
 
@@ -255,9 +280,13 @@ docker-compose up
 | `refreshToken` | string | OAuth 刷新令牌                                  |
 | `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
-| `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
-| `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
-| `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
+| `authMethod`   | string | 认证方式：`social` / `idc` / `external_idp` / `api_key` |
+| `clientId`     | string | IdC 或 External IdP 的客户端 ID（IdC/External IdP 认证必填）|
+| `clientSecret` | string | IdC 客户端密钥（IdC 必填）；External IdP 为空表示 public client |
+| `tokenEndpoint`| string | External IdP token endpoint URL（External IdP 必填）|
+| `issuerUrl`    | string | External IdP issuer URL（可选，仅记录/审计用）|
+| `scopes`       | string | External IdP scopes（空格分隔；含 `offline_access` 才有 rotating refresh_token）|
+| `kiroApiKey`   | string | Kiro API Key，格式 `ksk_*`（api_key 凭据必填，直接当 Bearer）|
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
@@ -272,6 +301,7 @@ docker-compose up
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
+- `external_idp` 用于 Kiro Enterprise SSO（如 Microsoft Entra ID），走标准 OAuth2 `refresh_token` grant，数据面调用自动附加 `tokentype: EXTERNAL_IDP` header
 
 #### 单凭据格式（旧格式，向后兼容）
 
@@ -462,6 +492,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*sonnet*` | `claude-sonnet-4.5` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
 | `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
+| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
 | `*opus*`（其他，宽松兜底） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
 

@@ -198,17 +198,10 @@ fn count_all_tokens_local(
         }
     }
 
-    // 用户消息
+    // 用户/助手消息：完整覆盖 text + tool_result 内容 + tool_use 入参，
+    // 否则 agentic 会话会被严重少算，导致客户端迟迟不压缩上下文。
     for msg in &messages {
-        if let serde_json::Value::String(s) = &msg.content {
-            total += count_tokens(s);
-        } else if let serde_json::Value::Array(arr) = &msg.content {
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
-            }
-        }
+        total += count_content_tokens(&msg.content);
     }
 
     // 工具定义
@@ -229,31 +222,50 @@ fn count_all_tokens_local(
 /// 复用 `count_tokens` 的字符权重 + 短文本放大系数，专门用于"当前轮"的开销估算，
 /// 区别于 `count_all_tokens_local` 那样把整个 messages/system/tools 都算上。
 pub(crate) fn count_message_tokens(content: &serde_json::Value) -> u64 {
+    count_content_tokens(content)
+}
+
+/// 统计单条消息 content 的 token 数（文本 + tool_result 内容 + tool_use 入参）
+///
+/// 在 agentic（Claude Code / MCP）会话里，`tool_result` 的输出和 `tool_use` 的
+/// 入参往往占据绝大部分上下文体量。任何只数 `text` 字段的实现都会严重少算，
+/// 进而让客户端的上下文表显示"远未满"、迟迟不触发 auto-compact，最终撞上
+/// 上游 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`。此处统一覆盖三类块。
+fn count_content_tokens(content: &serde_json::Value) -> u64 {
     let mut total = 0u64;
     match content {
-        serde_json::Value::String(s) => {
-            total += count_tokens(s);
-        }
+        serde_json::Value::String(s) => total += count_tokens(s),
         serde_json::Value::Array(arr) => {
             for item in arr {
+                // 普通文本块（以及任何携带 text 字段的块）
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     total += count_tokens(text);
                 }
-                // tool_result content 也可能携带文本
-                if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                    if let Some(c) = item.get("content") {
-                        match c {
-                            serde_json::Value::String(s) => total += count_tokens(s),
-                            serde_json::Value::Array(inner) => {
-                                for sub in inner {
-                                    if let Some(t) = sub.get("text").and_then(|v| v.as_str()) {
-                                        total += count_tokens(t);
+                match item.get("type").and_then(|v| v.as_str()) {
+                    // tool_result：内容可能是字符串，或子块数组（其中 text 块带文本）
+                    Some("tool_result") => {
+                        if let Some(c) = item.get("content") {
+                            match c {
+                                serde_json::Value::String(s) => total += count_tokens(s),
+                                serde_json::Value::Array(inner) => {
+                                    for sub in inner {
+                                        if let Some(t) = sub.get("text").and_then(|v| v.as_str()) {
+                                            total += count_tokens(t);
+                                        }
                                     }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
+                    // tool_use：助手工具调用入参（序列化为 JSON 后计数）
+                    Some("tool_use") => {
+                        if let Some(input) = item.get("input") {
+                            let s = serde_json::to_string(input).unwrap_or_default();
+                            total += count_tokens(&s);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -280,4 +292,84 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     }
 
     total.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn msg(role: &str, content: serde_json::Value) -> Message {
+        Message {
+            role: role.to_string(),
+            content,
+        }
+    }
+
+    /// 回归：tool_result 输出 + tool_use 入参必须计入整轮统计。
+    ///
+    /// 修复前 `count_all_tokens_local` 只数 `text` 字段，会把这类块完全漏掉，
+    /// 导致 agentic 会话严重少算、客户端迟迟不触发 auto-compact。
+    #[test]
+    fn count_all_tokens_local_includes_tool_result_and_tool_use() {
+        // 模拟一次文件读取：助手 tool_use 入参很长，user 回传的 tool_result 输出更长
+        let big_input = "a".repeat(4000); // ≈1000 tokens（纯 ASCII，4 字符/token）
+        let big_output = "b".repeat(8000); // ≈2000 tokens
+
+        let messages = vec![
+            msg(
+                "assistant",
+                json!([{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Read",
+                    "input": { "file_path": big_input }
+                }]),
+            ),
+            msg(
+                "user",
+                json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": big_output
+                }]),
+            ),
+        ];
+
+        let total = count_all_tokens_local(None, messages, None);
+
+        // tool I/O 合计约 3000 tokens；旧实现（只数 text）会得到接近 0 的值。
+        assert!(
+            total > 2500,
+            "tool_result/tool_use 内容必须计入，实际只得到 {total}"
+        );
+    }
+
+    /// tool_result 的子块数组形式（content 为 [{type:text,text:...}]）同样要计入。
+    #[test]
+    fn count_all_tokens_local_handles_structured_tool_result() {
+        let big_output = "c".repeat(8000); // ≈2000 tokens
+        let messages = vec![msg(
+            "user",
+            json!([{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [{ "type": "text", "text": big_output }]
+            }]),
+        )];
+
+        let total = count_all_tokens_local(None, messages, None);
+        assert!(total > 1800, "结构化 tool_result 文本必须计入，实际 {total}");
+    }
+
+    /// 普通文本消息的计数保持不变（无回归）。
+    #[test]
+    fn count_all_tokens_local_still_counts_plain_text() {
+        let messages = vec![
+            msg("user", json!("hello world this is a plain string message")),
+            msg("assistant", json!([{ "type": "text", "text": "a reply block" }])),
+        ];
+        let total = count_all_tokens_local(None, messages, None);
+        assert!(total >= 1);
+    }
 }

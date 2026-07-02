@@ -49,6 +49,7 @@ const VERIFY_MODELS: { label: string; value: string }[] = [
   { label: 'Haiku 4.5', value: 'claude-haiku-4-5' },
   { label: 'Sonnet 4.6', value: 'claude-sonnet-4-6' },
   { label: 'Opus 4.7', value: 'claude-opus-4-7' },
+  { label: 'Opus 4.8', value: 'claude-opus-4-8' },
 ]
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -71,6 +72,7 @@ function authMethodLabel(method?: string): string {
   if (method === 'api_key') return 'API Key'
   if (method === 'idc') return 'IdC'
   if (method === 'social') return 'Social'
+  if (method === 'external_idp') return 'External IdP'
   return method ?? '-'
 }
 
@@ -371,6 +373,20 @@ export function CredentialRow({
               )
             })()}
           </div>
+        </td>
+
+        {/* 并发 */}
+        <td className="px-2 py-2 text-sm whitespace-nowrap">
+          {credential.inFlightPeak === 0 ? (
+            <span className="text-xs text-muted-foreground">-</span>
+          ) : (
+            <>
+              <span className={credential.inFlight > 0 ? 'font-medium text-green-600' : 'text-muted-foreground'}>
+                {credential.inFlight}
+              </span>
+              <span className="text-xs text-muted-foreground"> / {credential.inFlightPeak}</span>
+            </>
+          )}
         </td>
 
         {/* 失败 / 用量 */}

@@ -30,6 +30,20 @@ interface CredentialInput {
   kiroApiKey?: string
   authMethod?: string
   endpoint?: string
+  // External IdP 字段
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  profileArn?: string
+  accessToken?: string
+  expiresAt?: string | number
+  email?: string
+}
+
+function isExternalIdpAuthMethod(method?: string): boolean {
+  if (!method) return false
+  const m = method.toLowerCase()
+  return m === 'external_idp' || m === 'externalidp' || m === 'external-idp'
 }
 
 interface VerificationResult {
@@ -266,11 +280,24 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const token = cred.refreshToken!.trim()
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const isExternalIdp = isExternalIdpAuthMethod(cred.authMethod)
+          // 优先级:input.authMethod === external_idp > clientId+clientSecret 推断
+          // External IdP public client 的 clientSecret 可能是空字符串,不能用 clientSecret 推断 idc
+          const authMethod: 'social' | 'idc' | 'external_idp' = isExternalIdp
+            ? 'external_idp'
+            : (clientId && clientSecret ? 'idc' : 'social')
 
-          // idc 模式下必须同时提供 clientId 和 clientSecret
+          // idc 模式下必须同时提供 clientId 和 clientSecret(external_idp 不受此约束)
           if (authMethod === 'social' && (clientId || clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+          if (authMethod === 'external_idp') {
+            if (!cred.tokenEndpoint?.trim()) {
+              throw new Error('external_idp 必须提供 tokenEndpoint')
+            }
+            if (!clientId) {
+              throw new Error('external_idp 必须提供 clientId')
+            }
           }
 
           const addedCred = await addCredential({
@@ -283,6 +310,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
+            // External IdP 透传(authMethod !== external_idp 时全部 undefined)
+            tokenEndpoint: authMethod === 'external_idp' ? cred.tokenEndpoint?.trim() : undefined,
+            issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() : undefined,
+            scopes: authMethod === 'external_idp' ? cred.scopes?.trim() : undefined,
+            profileArn: authMethod === 'external_idp' ? cred.profileArn?.trim() : undefined,
+            accessToken: authMethod === 'external_idp' ? cred.accessToken?.trim() : undefined,
+            expiresAt: authMethod === 'external_idp' ? cred.expiresAt : undefined,
+            email: authMethod === 'external_idp' ? cred.email?.trim() : undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -422,7 +457,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\nExternal IdP: [{"authMethod":"external_idp","refreshToken":"...","accessToken":"...","expiresAt":"...","clientId":"...","clientSecret":"","tokenEndpoint":"...","issuerUrl":"...","scopes":"...","profileArn":"arn:aws:codewhisperer:...","region":"us-east-1"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

@@ -28,8 +28,8 @@ const MAX_TOTAL_RETRIES: usize = 9;
 
 /// 上游错误结构化信息（通过 [`anyhow::Error::downcast_ref`] 获取）
 ///
-/// 用于让 HTTP handler 把上游真实状态码与响应体透传给客户端，
-/// 而不是统一吞成 502（CF / 反代会替换 5xx body，错误信息丢失）。
+/// 用于让 HTTP handler 保留上游真实状态码与错误分类，同时把详细响应体留在日志和
+/// 内部状态中，避免把上游诊断细节直接返回给客户端。
 #[derive(Debug, Clone)]
 pub struct UpstreamError {
     /// 上游 HTTP 状态码；网络层 / 链路错误时为 None
@@ -224,8 +224,14 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, u64)> {
-        self.call_api_with_retry(request_body, false).await
+    /// 返回 (Response, 凭据id, InFlightGuard)；guard 存活到调用方丢弃，计数自动归还。
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<(reqwest::Response, u64, crate::kiro::in_flight::InFlightGuard)> {
+        self.call_api_with_retry(request_body, false, conversation_id)
+            .await
     }
 
     /// 暴露底层 token manager（供 anthropic 层记账金额）
@@ -254,6 +260,8 @@ impl KiroProvider {
                 );
             }
         };
+
+        let _in_flight_guard = self.token_manager.track_request_start(ctx.id);
 
         let config = self.token_manager.config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -335,8 +343,14 @@ impl KiroProvider {
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<(reqwest::Response, u64)> {
-        self.call_api_with_retry(request_body, true).await
+    /// 返回 (Response, 凭据id, InFlightGuard)；guard 存活到调用方丢弃，计数自动归还。
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<(reqwest::Response, u64, crate::kiro::in_flight::InFlightGuard)> {
+        self.call_api_with_retry(request_body, true, conversation_id)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -352,14 +366,16 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            // MCP 调用（WebSearch 等工具）不涉及模型选择和会话粘性
+            let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            let _in_flight_guard = self.token_manager.track_request_start(ctx.id);
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -463,28 +479,40 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 - 上游限流：冷却凭据后立即换下一个（详见 call_api_with_retry 同名分支注释）
+            // 429 - 上游限流：同主路径逻辑,风控立即冷却,普通 429 连续 5 次才冷却
             if status.as_u16() == 429 {
                 let is_suspicious = body.contains("suspicious activity");
-                let cooldown = if is_suspicious {
-                    Duration::from_secs(600)
-                } else {
-                    Duration::from_secs(60)
-                };
                 tracing::warn!(
-                    "MCP 请求 429（{}，冷却凭据 #{} {} 秒，尝试 {}/{}）: {}",
+                    "MCP 请求 429（{}，凭据 #{}，尝试 {}/{}）: {}",
                     if is_suspicious { "风控" } else { "瞬态" },
                     ctx.id,
-                    cooldown.as_secs(),
                     attempt + 1,
                     max_retries,
                     body
                 );
-                let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
-                if !has_available {
-                    return Err(self.upstream_error_for(Some(429), &body, ctx.id)
-                        .exhausted()
-                        .into_anyhow());
+
+                if is_suspicious {
+                    let cooldown = Duration::from_secs(600);
+                    let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                    if !has_available {
+                        return Err(self.upstream_error_for(Some(429), &body, ctx.id)
+                            .exhausted()
+                            .into_anyhow());
+                    }
+                } else {
+                    let should_cooldown = self.token_manager.increment_429_count(ctx.id);
+                    if should_cooldown {
+                        let cooldown =
+                            Duration::from_secs(self.token_manager.config().rate_limit_cooldown_secs);
+                        let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                        if !has_available {
+                            return Err(self.upstream_error_for(Some(429), &body, ctx.id)
+                                .exhausted()
+                                .into_anyhow());
+                        }
+                    } else if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                 }
                 last_error = Some(self.upstream_error_for(Some(429), &body, ctx.id).into_anyhow());
                 continue;
@@ -535,7 +563,8 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<(reqwest::Response, u64, crate::kiro::in_flight::InFlightGuard)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -547,13 +576,20 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), conversation_id)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // 每次上游尝试都登记:在途 +1(guard 随本轮作用域 drop 自动归还)、窗口记 start
+            let in_flight_guard = self.token_manager.track_request_start(ctx.id);
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -610,7 +646,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok((response, ctx.id));
+                return Ok((response, ctx.id, in_flight_guard));
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -626,6 +662,13 @@ impl KiroProvider {
                     body
                 );
 
+                self.token_manager.log_rate_limit_incident(
+                    ctx.id,
+                    "402_quota",
+                    model.as_deref(),
+                    attempt as u32 + 1,
+                    None,
+                );
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id)
@@ -664,6 +707,13 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
+                self.token_manager.log_rate_limit_incident(
+                    ctx.id,
+                    "40x_auth",
+                    model.as_deref(),
+                    attempt as u32 + 1,
+                    None,
+                );
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     return Err(self.upstream_error_for(Some(status.as_u16()), &body, ctx.id)
@@ -676,33 +726,64 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 - 上游限流：冷却当前凭据后立即换下一个，不在同一凭据上重试。
-            // 在同一凭据上重试 429 只会加剧风控判定（Kiro 把高频重试视为可疑活动）。
-            // 风控类 429（响应体含 "suspicious activity"）长冷却 10 分钟，普通 429 短冷却 60 秒。
+            // 429 - 上游限流：
+            // - 风控类("suspicious activity")立即冷却 10 分钟
+            // - 普通 429 容忍连续 5 次后才冷却 60 秒,避免偶发限流引起不必要的故障转移级联
             if status.as_u16() == 429 {
                 let is_suspicious = body.contains("suspicious activity");
-                let cooldown = if is_suspicious {
-                    Duration::from_secs(600)
-                } else {
-                    Duration::from_secs(60)
-                };
                 tracing::warn!(
-                    "API 请求 429（{}，冷却凭据 #{} {} 秒，尝试 {}/{}）: {}",
+                    "API 请求 429（{}，凭据 #{}，尝试 {}/{}）: {}",
                     if is_suspicious { "风控" } else { "瞬态" },
                     ctx.id,
-                    cooldown.as_secs(),
                     attempt + 1,
                     max_retries,
                     body
                 );
-                let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
-                if !has_available {
-                    return Err(self.upstream_error_for(Some(429), &body, ctx.id)
-                        .exhausted()
-                        .into_anyhow());
+
+                if is_suspicious {
+                    // 风控类：立即冷却 10 分钟
+                    let cooldown = Duration::from_secs(600);
+                    self.token_manager.log_rate_limit_incident(
+                        ctx.id,
+                        "429_suspicious",
+                        model.as_deref(),
+                        attempt as u32 + 1,
+                        Some(cooldown.as_secs()),
+                    );
+                    let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                    if !has_available {
+                        return Err(self.upstream_error_for(Some(429), &body, ctx.id)
+                            .exhausted()
+                            .into_anyhow());
+                    }
+                } else {
+                    // 普通 429：在同一凭据上重试,累计 5 次才冷却。
+                    // 不切换凭据——保留 prompt cache 命中,避免切换引发级联。
+                    let should_cooldown = self.token_manager.increment_429_count(ctx.id);
+                    if should_cooldown {
+                        let cooldown =
+                            Duration::from_secs(self.token_manager.config().rate_limit_cooldown_secs);
+                        self.token_manager.log_rate_limit_incident(
+                            ctx.id,
+                            "429_transient",
+                            model.as_deref(),
+                            attempt as u32 + 1,
+                            Some(cooldown.as_secs()),
+                        );
+                        let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                        if !has_available {
+                            return Err(self.upstream_error_for(Some(429), &body, ctx.id)
+                                .exhausted()
+                                .into_anyhow());
+                        }
+                    } else {
+                        // 未达冷却阈值,短暂等待后在同一凭据上重试
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
+                    }
                 }
                 last_error = Some(self.upstream_error_for(Some(429), &body, ctx.id).into_anyhow());
-                // 不 sleep：下一轮 acquire_context 会自动跳过冷却中的凭据
                 continue;
             }
 

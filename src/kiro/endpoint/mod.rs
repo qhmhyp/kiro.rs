@@ -70,11 +70,20 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
-/// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
+/// 表示"本计费周期额度已耗尽"的 reason 取值
+///
+/// - `MONTHLY_REQUEST_COUNT`：月度免费/订阅额度用尽
+/// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`：超额（overage）消费上限也已触顶
+///
+/// 两者都意味着该凭据在本周期内不再可用，应禁用并故障转移。
+const QUOTA_EXHAUSTED_REASONS: [&str; 2] =
+    ["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
+
+/// 默认的"额度用尽"判断逻辑
 ///
 /// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。
 pub fn default_is_monthly_request_limit(body: &str) -> bool {
-    if body.contains("MONTHLY_REQUEST_COUNT") {
+    if QUOTA_EXHAUSTED_REASONS.iter().any(|r| body.contains(r)) {
         return true;
     }
 
@@ -82,18 +91,12 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
         return false;
     };
 
-    if value
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
-    {
-        return true;
-    }
+    let reason_matches = |v: &serde_json::Value| {
+        v.as_str().is_some_and(|s| QUOTA_EXHAUSTED_REASONS.contains(&s))
+    };
 
-    value
-        .pointer("/error/reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    value.get("reason").is_some_and(reason_matches)
+        || value.pointer("/error/reason").is_some_and(reason_matches)
 }
 
 /// 默认的 bearer token 失效判断逻辑
@@ -114,6 +117,18 @@ mod tests {
     #[test]
     fn test_default_monthly_request_limit_nested_reason() {
         let body = r#"{"error":{"reason":"MONTHLY_REQUEST_COUNT"}}"#;
+        assert!(default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_monthly_request_limit_detects_overage_limit() {
+        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_monthly_request_limit_nested_overage_limit() {
+        let body = r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
         assert!(default_is_monthly_request_limit(body));
     }
 

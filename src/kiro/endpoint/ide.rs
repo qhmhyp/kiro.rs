@@ -83,6 +83,8 @@ impl KiroEndpoint for IdeEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp_credential() {
+            req = req.header("tokentype", "EXTERNAL_IDP");
         }
         req
     }
@@ -101,6 +103,8 @@ impl KiroEndpoint for IdeEndpoint {
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp_credential() {
+            req = req.header("tokentype", "EXTERNAL_IDP");
         }
         req
     }

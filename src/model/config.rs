@@ -102,6 +102,16 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 普通 429 触发的冷却时长(秒)。默认 8 秒。
+    ///
+    /// 实测数据:Kiro 上游真实 throttle 是凭据级短期窗口,触发后 ~5s 同模型恢复 200,
+    /// 跨模型 1.3s 内同步 throttle 之后 ~4-7s 恢复,完整恢复 ~10-15s。所以默认 8s
+    /// 覆盖约 70-80% 的真实窗口,与"连续 5 次累计才升级"配合,客户端可感的不可用
+    /// 窗口压到 ~8s 级。改短(<5s)风险:立刻又被 throttle;改长(>30s)收益甚低。
+    /// 风控类 429(suspicious activity)不受此影响,固定 10 分钟。
+    #[serde(default = "default_rate_limit_cooldown_secs")]
+    pub rate_limit_cooldown_secs: u64,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -161,6 +171,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_rate_limit_cooldown_secs() -> u64 {
+    8
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -189,6 +203,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
+            rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
             endpoints: HashMap::new(),
             pricing: None,
             config_path: None,

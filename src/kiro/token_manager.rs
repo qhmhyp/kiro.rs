@@ -17,10 +17,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::activity_window::{ActivityWindow, WindowStats};
+use crate::kiro::in_flight::{InFlightGuard, InFlightTracker};
+use crate::kiro::incident_log::{self, IncidentRecord};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -74,7 +78,13 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
         bail!("refreshToken 为空");
     }
 
-    if refresh_token.len() < 100 || refresh_token.ends_with("...") || refresh_token.contains("...")
+    // 长度 < 100 的"截断保护"只对 Kiro IDE 自家 refresh_token 适用（social/idc 都是 JWT 等长字符串）。
+    // External IdP（Microsoft Entra ID 等）颁发的 refresh_token 长度由各 IdP 决定，不应套这个阈值。
+    let skip_truncation_check = credentials.is_external_idp_credential();
+    if !skip_truncation_check
+        && (refresh_token.len() < 100
+            || refresh_token.ends_with("...")
+            || refresh_token.contains("..."))
     {
         bail!(
             "refreshToken 已被截断（长度: {} 字符）。\n\
@@ -133,6 +143,11 @@ pub(crate) async fn refresh_token(
         || auth_method.eq_ignore_ascii_case("iam")
     {
         refresh_idc_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("external_idp")
+        || auth_method.eq_ignore_ascii_case("externalidp")
+        || auth_method.eq_ignore_ascii_case("external-idp")
+    {
+        refresh_external_idp_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
     }
@@ -319,6 +334,96 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 刷新 External IdP Token (Microsoft Entra ID / 通用 OAuth2 IdP)
+///
+/// 直接向凭据自带的 `token_endpoint` 走标准 OAuth2 `refresh_token` grant。
+/// `client_secret` 非空时按 confidential client 发送，否则按 public client（不传该字段）。
+/// `scopes` 非空时透传到 `scope` 表单字段；含 `offline_access` 才能拿到 rotating refresh_token。
+///
+/// 响应里的 `refresh_token` 是 rotating 的，必须回写，否则下次刷新会用废 token 失败。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    _config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
+
+    let client = build_client(proxy, 60, _config.tls_backend)?;
+
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id.as_str()),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    if let Some(scopes) = credentials.scopes.as_deref() {
+        if !scopes.is_empty() {
+            form.push(("scope", scopes));
+        }
+    }
+    if let Some(secret) = credentials.client_secret.as_deref() {
+        if !secret.is_empty() {
+            form.push(("client_secret", secret));
+        }
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .header("Connection", "close")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+
+        // OAuth2 标准 invalid_grant → refresh_token 永久失效
+        if status.as_u16() == 400 && body_text.contains("\"invalid_grant\"") {
+            return Err(RefreshTokenInvalidError {
+                message: format!("External IdP refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            400 => "External IdP 请求参数错误",
+            401 => "External IdP 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，External IdP token endpoint 暂时不可用",
+            _ => "External IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -371,6 +476,8 @@ pub(crate) async fn get_usage_limits(
 
     if credentials.is_api_key_credential() {
         request = request.header("tokentype", "API_KEY");
+    } else if credentials.is_external_idp_credential() {
+        request = request.header("tokentype", "EXTERNAL_IDP");
     }
 
     let response = request.send().await?;
@@ -390,6 +497,81 @@ pub(crate) async fn get_usage_limits(
 
     let data: UsageLimitsResponse = response.json().await?;
     Ok(data)
+}
+
+/// 调用 Kiro 控制面 `ListAvailableProfiles`,返回当前账号绑定的 profileArn(若存在多个取首个)。
+///
+/// 用途:External IdP 凭据导入时往往不含 profileArn(Microsoft Entra ID 颁发的 JWT 里没有此信息),
+/// 而 `getUsageLimits` / `generateAssistantResponse` 又必需 profileArn,否则后端返回
+/// `403 User is not authorized`。调用此函数从 `management.{region}.kiro.dev/ListAvailableProfiles`
+/// 自动解析,免去用户手工填写。
+///
+/// 端点契约同 `kiro-go-plus` 的 `listAvailableProfiles`:
+/// - `POST https://management.{region}.kiro.dev/ListAvailableProfiles`
+/// - Body: `{"maxResults":10}`
+/// - Bearer access_token + `tokentype: EXTERNAL_IDP`(对 external_idp 凭据)
+/// - 响应: `{"profiles":[{"arn":"..."}]}`
+///
+/// 返回 `Ok(None)` 表示账号下没有任何 profile(账户配置异常,非本地错误);
+/// 返回 `Err` 表示传输或 4xx/5xx 错误,调用方决定是否禁用凭据。
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    tracing::debug!("正在调用 ListAvailableProfiles 自动解析 profileArn...");
+
+    let region = credentials.effective_api_region(config);
+    let host = format!("management.{}.kiro.dev", region);
+    let url = format!("https://{}/ListAvailableProfiles", host);
+
+    let client = build_client(proxy, 30, config.tls_backend)?;
+    let mut request = client
+        .post(&url)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "aws-sdk-js/1.0.0 KiroIDE")
+        .header("x-amz-user-agent", "aws-sdk-js/1.0.0 KiroIDE")
+        .header("x-amzn-codewhisperer-optout", "true")
+        .header("host", &host)
+        .header("Connection", "close")
+        .body(r#"{"maxResults":10}"#);
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    } else if credentials.is_external_idp_credential() {
+        request = request.header("tokentype", "EXTERNAL_IDP");
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!(
+            "ListAvailableProfiles 失败: HTTP {} {}",
+            status,
+            body_text
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ProfileEntry {
+        arn: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ListProfilesResponse {
+        #[serde(default)]
+        profiles: Vec<ProfileEntry>,
+    }
+
+    let data: ListProfilesResponse = response.json().await?;
+    Ok(data
+        .profiles
+        .into_iter()
+        .filter_map(|p| p.arn)
+        .find(|a| !a.trim().is_empty()))
 }
 
 // ============================================================================
@@ -428,6 +610,8 @@ struct CredentialEntry {
     cache_creation_tokens_total: u64,
     /// 累计输出 token
     output_tokens_total: u64,
+    /// 连续 429 计数:累计 5 次才冷却,避免偶发 429 导致不必要的故障转移和级联
+    consecutive_429_count: u32,
 }
 
 /// 凭据最近一次上游错误（用于状态展示）
@@ -463,6 +647,9 @@ pub struct CredentialUpdate {
     pub proxy_password: Option<String>,
     pub endpoint: Option<String>,
     pub priority: Option<u32>,
+    pub token_endpoint: Option<String>,
+    pub issuer_url: Option<String>,
+    pub scopes: Option<String>,
 }
 
 /// 禁用原因
@@ -565,6 +752,10 @@ pub struct CredentialEntrySnapshot {
     pub cache_creation_tokens_total: u64,
     /// 累计输出 token
     pub output_tokens_total: u64,
+    /// 当前在途请求数(实时并发)
+    pub in_flight: u32,
+    /// 进程启动以来最高瞬时并发
+    pub in_flight_peak: u32,
 }
 
 /// 凭据管理器状态快照
@@ -604,6 +795,13 @@ pub struct MultiTokenManager {
     stats_dirty: AtomicBool,
     /// 模型单价表（内置默认 + config 覆盖），构造时装配一次
     pricing: crate::pricing::PricingTable,
+    /// 会话→凭据粘性映射，最大化上游 prompt cache 命中率
+    convo_sticky: moka::sync::Cache<String, u64>,
+    /// 在途请求计数(实时并发观测)
+    in_flight: InFlightTracker,
+    /// 每凭据滚动活动窗口(限速观测);与 entries 锁独立,避免热路径锁竞争。
+    /// 锁序约束:绝不在持有 entries 锁时再取本锁(反之亦然),防死锁。
+    activity: Mutex<HashMap<u64, ActivityWindow>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -695,6 +893,7 @@ impl MultiTokenManager {
                     cache_read_tokens_total: 0,
                     cache_creation_tokens_total: 0,
                     output_tokens_total: 0,
+                    consecutive_429_count: 0,
                 }
             })
             .collect();
@@ -716,6 +915,43 @@ impl MultiTokenManager {
                 );
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+            }
+        }
+
+        // 校验 External IdP 凭据配置完整性：必须提供 tokenEndpoint + clientId + refreshToken
+        for entry in &mut entries {
+            if entry.credentials.is_external_idp_credential() {
+                let missing = entry.credentials.token_endpoint.is_none()
+                    || entry.credentials.client_id.is_none()
+                    || entry.credentials.refresh_token.is_none();
+                if missing {
+                    tracing::warn!(
+                        "凭据 #{} 配置了 authMethod=external_idp 但缺少 tokenEndpoint/clientId/refreshToken 之一，已自动禁用",
+                        entry.id
+                    );
+                    entry.disabled = true;
+                    entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+                    continue;
+                }
+                // profileArn 缺失:启动加载阶段不主动 fetch(避免网络阻塞),只 warn 提示。
+                // 凭据本身仍可用于推理(数据面请求会 inject profileArn 到 body,缺了会被
+                // codewhisperer 拒成 403),建议通过 admin API PATCH 补填,或重新走 add_credential
+                // 流程触发自动 ListAvailableProfiles 解析。
+                if entry
+                    .credentials
+                    .profile_arn
+                    .as_deref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    tracing::warn!(
+                        "凭据 #{} (external_idp) 缺 profileArn,数据面请求会被后端拒成 403。\
+                         请通过 PATCH /api/admin/credentials/{} 设置 profileArn 字段,\
+                         或在 admin UI 编辑此凭据填入 ARN 后保存",
+                        entry.id,
+                        entry.id
+                    );
+                }
             }
         }
 
@@ -744,6 +980,11 @@ impl MultiTokenManager {
         let pricing = crate::pricing::PricingTable::builtin()
             .with_overrides(config.pricing.as_ref());
 
+        let convo_sticky = moka::sync::Cache::builder()
+            .max_capacity(50_000)
+            .time_to_idle(StdDuration::from_secs(600))
+            .build();
+
         let manager = Self {
             config,
             proxy,
@@ -754,6 +995,9 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             pricing,
+            convo_sticky,
+            in_flight: InFlightTracker::default(),
+            activity: Mutex::new(HashMap::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -836,6 +1080,62 @@ impl MultiTokenManager {
         Some(result)
     }
 
+    /// 带会话粘性的凭据选择：同一 conversation_id 尽量复用同一凭据，最大化上游 prompt cache 命中
+    ///
+    /// 1. 若有粘性映射且凭据仍可用 → 直接返回（cache hit）
+    /// 2. 粘性凭据不可用 → 失效映射，回退 LRU
+    /// 3. 无 conversation_id → 纯 LRU（与 `acquire_credential` 行为一致）
+    fn acquire_credential_sticky(
+        &self,
+        model: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        if let Some(conv_id) = conversation_id {
+            if let Some(sticky_id) = self.convo_sticky.get(conv_id) {
+                let mut entries = self.entries.lock();
+                let is_opus = model
+                    .map(|m| m.to_lowercase().contains("opus"))
+                    .unwrap_or(false);
+                let now = Utc::now();
+
+                let usable = entries.iter().any(|e| {
+                    e.id == sticky_id
+                        && !e.disabled
+                        && e.cooldown_until.map_or(true, |t| now >= t)
+                        && (!is_opus || e.credentials.supports_opus())
+                });
+
+                if usable {
+                    if let Some(chosen) = entries.iter_mut().find(|e| e.id == sticky_id) {
+                        chosen.last_used_at = Some(Utc::now().to_rfc3339());
+                        let result = (chosen.id, chosen.credentials.clone());
+                        drop(entries);
+                        self.save_stats_debounced();
+                        tracing::debug!("会话 {} 粘性命中凭据 #{}", conv_id, sticky_id);
+                        return Some(result);
+                    }
+                }
+
+                drop(entries);
+                self.convo_sticky.invalidate(conv_id);
+                tracing::info!(
+                    "会话 {} 粘性凭据 #{} 不可用，回退 LRU",
+                    conv_id,
+                    sticky_id
+                );
+            }
+        }
+
+        let result = self.acquire_credential(model)?;
+
+        if let Some(conv_id) = conversation_id {
+            self.convo_sticky.insert(conv_id.to_string(), result.0);
+            tracing::debug!("会话 {} 绑定凭据 #{}", conv_id, result.0);
+        }
+
+        Some(result)
+    }
+
     /// 自愈：当所有凭据均被 `TooManyFailures` 自动禁用时，重置失败计数并重新启用。
     ///
     /// 仅对 `TooManyFailures` 类型生效；`QuotaExceeded` / `InvalidRefreshToken` /
@@ -872,7 +1172,12 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `conversation_id`: 可选的会话 ID，用于凭据粘性路由以最大化上游 prompt cache 命中
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -886,12 +1191,11 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = match self.acquire_credential(model) {
+            let (id, credentials) = match self.acquire_credential_sticky(model, conversation_id) {
                 Some(x) => x,
                 None => {
-                    // 全灭：尝试 TooManyFailures 自愈后再选一次
                     if self.self_heal_too_many_failures() {
-                        match self.acquire_credential(model) {
+                        match self.acquire_credential_sticky(model, conversation_id) {
                             Some(x) => x,
                             None => anyhow::bail!("所有凭据均不可用（已禁用或冷却中，0/{}）", total),
                         }
@@ -1214,6 +1518,7 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.consecutive_429_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功一次后清空"最近错误"，状态徽章回归正常
@@ -1226,6 +1531,119 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 登记一次上游请求尝试:在途 +1(guard 归还)、活动窗口记 start。
+    /// 每次"上游 POST"都算一次,故障转移重试各算一次——限速分析关心的
+    /// 正是上游视角的请求频率。
+    pub fn track_request_start(&self, id: u64) -> InFlightGuard {
+        self.activity
+            .lock()
+            .entry(id)
+            .or_default()
+            .record_start(Utc::now());
+        self.in_flight.track(id)
+    }
+
+    /// 该凭据当前窗口统计(测试与观测记录共用)。
+    /// 注意:有条目时会顺带修剪过期事件(stats 内部 prune);无条目返回全零,不创建条目。
+    pub fn window_stats(&self, id: u64) -> WindowStats {
+        self.activity
+            .lock()
+            .get_mut(&id)
+            .map(|w| w.stats(Utc::now()))
+            .unwrap_or_default()
+    }
+
+    /// 组装一条观测记录(事故快照与基线采样共用)
+    pub fn build_observability_record(
+        &self,
+        id: u64,
+        kind: &str,
+        model: Option<&str>,
+        attempt: Option<u32>,
+        cooldown_secs: Option<u64>,
+    ) -> IncidentRecord {
+        let stats = self.window_stats(id);
+        let (in_flight, in_flight_peak) = self.in_flight.get(id);
+        IncidentRecord {
+            ts: Utc::now().to_rfc3339(),
+            credential: id,
+            kind: kind.to_string(),
+            in_flight,
+            in_flight_peak,
+            req_1m: stats.req_1m,
+            req_5m: stats.req_5m,
+            tokens_in_1m: stats.tokens_in_1m,
+            tokens_out_1m: stats.tokens_out_1m,
+            model: model.map(str::to_string),
+            attempt,
+            secs_since_last_429: stats.secs_since_last_429,
+            cooldown_secs,
+        }
+    }
+
+    /// 事故快照:专用 target 结构化日志 + JSONL 落盘(best-effort)
+    ///
+    /// 注意:调用时触发事故的那次请求仍在途(guard 未 drop),故 in_flight ≥ 1
+    /// 且含其自身;分析侧不要把它误读为"另有 N 条并发"。
+    pub fn log_rate_limit_incident(
+        &self,
+        id: u64,
+        kind: &str,
+        model: Option<&str>,
+        attempt: u32,
+        cooldown_secs: Option<u64>,
+    ) {
+        let r = self.build_observability_record(id, kind, model, Some(attempt), cooldown_secs);
+        tracing::warn!(
+            target: "rate_limit_incident",
+            credential = r.credential,
+            kind = %r.kind,
+            in_flight = r.in_flight,
+            in_flight_peak = r.in_flight_peak,
+            req_1m = r.req_1m,
+            req_5m = r.req_5m,
+            tokens_in_1m = r.tokens_in_1m,
+            tokens_out_1m = r.tokens_out_1m,
+            model = r.model.as_deref().unwrap_or(""),
+            attempt = ?r.attempt,
+            secs_since_last_429 = ?r.secs_since_last_429,
+            cooldown_secs = ?r.cooldown_secs,
+            "限速观测事件"
+        );
+        self.append_observability_record(&r);
+    }
+
+    /// 基线采样:返回所有"有活动"凭据的记录(无活动不采,避免无意义数据)
+    pub fn baseline_records(&self) -> Vec<IncidentRecord> {
+        let ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries.iter().map(|e| e.id).collect()
+        };
+        ids.into_iter()
+            .filter(|id| {
+                // filter 与 build_observability_record 各取一次 window_stats(两次短锁)——
+                // 60s 周期的采样路径,不值得为省一次锁引入重复的记录组装代码
+                let stats = self.window_stats(*id);
+                let (cur, _) = self.in_flight.get(*id);
+                stats.req_1m > 0 || cur > 0
+            })
+            .map(|id| self.build_observability_record(id, "baseline", None, None, None))
+            .collect()
+    }
+
+    /// 基线采样落盘(后台任务每 60s 调一次)
+    pub fn log_baseline_samples(&self) {
+        for r in self.baseline_records() {
+            self.append_observability_record(&r);
+        }
+    }
+
+    fn append_observability_record(&self, r: &IncidentRecord) {
+        if let Some(dir) = self.cache_dir() {
+            incident_log::append_jsonl(&dir.join("rate_limit_incidents.jsonl"), r);
+        }
     }
 
     /// 累计指定凭据的 token 消耗金额（USD）与 token 明细
@@ -1268,6 +1686,12 @@ impl MultiTokenManager {
                 );
             }
         }
+        // entries 锁已释放后再取 activity 锁，符合锁序约束
+        self.activity.lock().entry(id).or_default().record_tokens(
+            Utc::now(),
+            (input.max(0) + cache_read.max(0) + cache_creation.max(0)) as u64,
+            output.max(0) as u64,
+        );
         self.save_stats_debounced();
     }
 
@@ -1350,7 +1774,8 @@ impl MultiTokenManager {
 
     /// 报告指定凭据额度已用尽
     ///
-    /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
+    /// 用于处理 402 Payment Required 且 reason 表示额度用尽
+    /// （`MONTHLY_REQUEST_COUNT` / `OVERAGE_REQUEST_LIMIT_EXCEEDED`）的场景：
     /// - 立即禁用该凭据（不等待连续失败阈值）
     /// - 立即持久化禁用状态（避免崩溃后状态丢失，重试又炸一次）
     /// - 下一次 `acquire_credential` 自然落到其他可用凭据
@@ -1374,7 +1799,7 @@ impl MultiTokenManager {
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
-            tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
+            tracing::error!("凭据 #{} 额度已用尽（含超额上限），已被禁用", id);
 
             let has_available = any_entry_available(&entries);
             if !has_available {
@@ -1392,6 +1817,22 @@ impl MultiTokenManager {
 
     /// 报告指定凭据被上游限流（HTTP 429），将其加入临时冷却。
     ///
+    /// 递增凭据的 429 连击计数,返回是否应执行冷却(≥5 次时触发)。
+    /// 触发冷却后计数重置,调用方应紧跟 `report_rate_limited`。
+    pub fn increment_429_count(&self, id: u64) -> bool {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.consecutive_429_count += 1;
+            if entry.consecutive_429_count >= 5 {
+                entry.consecutive_429_count = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 报告指定凭据被上游限流（429），设置冷却期使其暂时不可用。
+    ///
     /// 冷却期间该凭据不会被 `acquire_credential` 选中；冷却到期后由 `acquire_credential`
     /// 的过滤条件自然恢复可用，无需重启或外部干预。冷却状态**不持久化**——
     /// 设计意图：这是分钟级瞬态状态，进程重启耗时已远超典型冷却窗口。
@@ -1403,24 +1844,33 @@ impl MultiTokenManager {
     /// # Returns
     /// 调用后是否还有可用凭据（未禁用且未冷却），便于调用方判断要不要继续切换重试
     pub fn report_rate_limited(&self, id: u64, cooldown: StdDuration) -> bool {
-        let mut entries = self.entries.lock();
-        let now = Utc::now();
-        let until = now + Duration::from_std(cooldown).unwrap_or(Duration::seconds(60));
+        let has_available = {
+            let mut entries = self.entries.lock();
+            let now = Utc::now();
+            let until = now + Duration::from_std(cooldown).unwrap_or(Duration::seconds(60));
 
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            entry.cooldown_until = Some(until);
-            entry.last_used_at = Some(now.to_rfc3339());
-            tracing::warn!(
-                "凭据 #{} 被上游限流，冷却 {} 秒至 {}",
-                id,
-                cooldown.as_secs(),
-                until.to_rfc3339()
-            );
-        }
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.cooldown_until = Some(until);
+                entry.last_used_at = Some(now.to_rfc3339());
+                tracing::warn!(
+                    "凭据 #{} 被上游限流，冷却 {} 秒至 {}",
+                    id,
+                    cooldown.as_secs(),
+                    until.to_rfc3339()
+                );
+            }
 
-        entries
-            .iter()
-            .any(|e| !e.disabled && e.cooldown_until.map_or(true, |t| now >= t))
+            entries
+                .iter()
+                .any(|e| !e.disabled && e.cooldown_until.map_or(true, |t| now >= t))
+        };
+        // entries 锁已释放后再取 activity 锁，符合锁序约束
+        self.activity
+            .lock()
+            .entry(id)
+            .or_default()
+            .record_429(Utc::now());
+        has_available
     }
 
     /// 报告指定凭据刷新 Token 失败。
@@ -1529,6 +1979,7 @@ impl MultiTokenManager {
     /// `current_id` 按 `last_used_at` 最新（最近一次被选中）的 entry 计算；
     /// 没有任何 entry 被选中过时为 0。该字段仅用于前端展示，不参与调度。
     pub fn snapshot(&self) -> ManagerSnapshot {
+        let in_flight = self.in_flight.snapshot();
         let entries = self.entries.lock();
         let current_id = entries
             .iter()
@@ -1605,6 +2056,8 @@ impl MultiTokenManager {
                     cache_read_tokens_total: e.cache_read_tokens_total,
                     cache_creation_tokens_total: e.cache_creation_tokens_total,
                     output_tokens_total: e.output_tokens_total,
+                    in_flight: in_flight.get(&e.id).map(|v| v.0).unwrap_or(0),
+                    in_flight_peak: in_flight.get(&e.id).map(|v| v.1).unwrap_or(0),
                 })
                 .collect(),
             current_id,
@@ -1703,6 +2156,15 @@ impl MultiTokenManager {
             apply(&mut c.proxy_username, &update.proxy_username);
             apply(&mut c.proxy_password, &update.proxy_password);
             apply(&mut c.endpoint, &update.endpoint);
+
+            // External IdP 鉴权字段：改 token_endpoint / scopes 等同改鉴权配置，
+            // 触发下次请求重新刷新（旧 access_token 不再有效）
+            if update.token_endpoint.is_some() || update.scopes.is_some() {
+                invalidate_token = true;
+            }
+            apply(&mut c.token_endpoint, &update.token_endpoint);
+            apply(&mut c.issuer_url, &update.issuer_url);
+            apply(&mut c.scopes, &update.scopes);
 
             if let Some(p) = update.priority {
                 c.priority = p;
@@ -1926,7 +2388,15 @@ impl MultiTokenManager {
         }
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
+        //    External IdP 导入短路：携带未过期的 access_token 时跳过初始刷新，
+        //    避免烧掉 single-use rotating refresh_token（Microsoft Entra ID 等）。
         let mut validated_cred = if new_cred.is_api_key_credential() {
+            new_cred.clone()
+        } else if new_cred.is_external_idp_credential()
+            && new_cred.access_token.is_some()
+            && !is_token_expired(&new_cred)
+        {
+            tracing::info!("External IdP 凭据导入短路：携带未过期 access_token，跳过初始刷新");
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
@@ -1961,6 +2431,55 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
 
+        // External IdP 自动解析 profileArn:Microsoft Entra ID 等 IdP 颁发的 JWT 不含 profileArn,
+        // 而 getUsageLimits/generateAssistantResponse 又必需它,缺了会被 codewhisperer 后端拒成
+        // 403 User is not authorized。这里在 access_token 就绪后,自动调 ListAvailableProfiles
+        // 解析并回填,免去用户手填。失败仅 warn,凭据照样落库(后续可通过 PATCH 手动设置)。
+        if validated_cred.is_external_idp_credential()
+            && validated_cred
+                .profile_arn
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+        {
+            if let Some(token) = validated_cred.access_token.clone() {
+                let effective_proxy = validated_cred.effective_proxy(self.proxy.as_ref());
+                match list_available_profiles(
+                    &validated_cred,
+                    &self.config,
+                    &token,
+                    effective_proxy.as_ref(),
+                )
+                .await
+                {
+                    Ok(Some(arn)) => {
+                        tracing::info!(
+                            "External IdP 凭据自动解析 profileArn: {}",
+                            arn
+                        );
+                        validated_cred.profile_arn = Some(arn);
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "External IdP 凭据 ListAvailableProfiles 返回空列表,\
+                             profileArn 仍缺失,后续 getUsageLimits 会返回 403"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "External IdP 凭据 ListAvailableProfiles 失败({}),\
+                             profileArn 仍缺失,后续 getUsageLimits 会返回 403",
+                            e
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "External IdP 凭据缺 access_token 且未带 profileArn,无法自动解析"
+                );
+            }
+        }
+
         {
             let mut entries = self.entries.lock();
             entries.push(CredentialEntry {
@@ -1979,6 +2498,7 @@ impl MultiTokenManager {
                 cache_read_tokens_total: 0,
                 cache_creation_tokens_total: 0,
                 output_tokens_total: 0,
+                consecutive_429_count: 0,
             });
         }
 
@@ -2137,6 +2657,26 @@ mod tests {
     fn test_validate_refresh_token_valid() {
         let mut credentials = KiroCredentials::default();
         credentials.refresh_token = Some("a".repeat(150));
+        let result = validate_refresh_token(&credentials);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_refresh_token_short_rejected_for_social() {
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("social".to_string());
+        credentials.refresh_token = Some("short_token".to_string());
+        let err = validate_refresh_token(&credentials).unwrap_err();
+        assert!(err.to_string().contains("已被截断"));
+    }
+
+    #[test]
+    fn test_validate_refresh_token_short_accepted_for_external_idp() {
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("external_idp".to_string());
+        // Microsoft refresh token 实际很长，但其它 IdP 可能短于 100。
+        // 这里用很短的 token 验证 external_idp 跳过 Kiro IDE 自家的截断检测。
+        credentials.refresh_token = Some("short_token_42_chars_should_not_be_truncated".to_string());
         let result = validate_refresh_token(&credentials);
         assert!(result.is_ok());
     }
@@ -2358,6 +2898,81 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_token_manager_external_idp_missing_fields_auto_disabled() {
+        let config = Config::default();
+
+        let full = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("ms-refresh".to_string()),
+            client_id: Some("dab27a3f-8718-4db2-86cc-29fdd5bbaab7".to_string()),
+            token_endpoint: Some(
+                "https://login.microsoftonline.com/tid/oauth2/v2.0/token".to_string(),
+            ),
+            ..KiroCredentials::default()
+        };
+        let missing_te = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("x".to_string()),
+            client_id: Some("cid".to_string()),
+            ..KiroCredentials::default()
+        };
+        let missing_cid = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("x".to_string()),
+            token_endpoint: Some("https://idp/token".to_string()),
+            ..KiroCredentials::default()
+        };
+        let missing_rt = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            client_id: Some("cid".to_string()),
+            token_endpoint: Some("https://idp/token".to_string()),
+            ..KiroCredentials::default()
+        };
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![full, missing_te, missing_cid, missing_rt],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(manager.total_count(), 4);
+        // 只有 full 可用，3 个不完整的被自动禁用
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_external_idp_refresh_response_deserializes_snake_case() {
+        // Microsoft Entra ID 返回 snake_case 字段
+        let json = r#"{
+            "token_type": "Bearer",
+            "scope": "api://x/codewhisperer:conversations",
+            "expires_in": 5057,
+            "ext_expires_in": 5057,
+            "access_token": "eyJ.new.access",
+            "refresh_token": "1.new-refresh-token"
+        }"#;
+        let parsed: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.access_token, "eyJ.new.access");
+        assert_eq!(parsed.refresh_token.as_deref(), Some("1.new-refresh-token"));
+        assert_eq!(parsed.expires_in, Some(5057));
+    }
+
+    #[test]
+    fn test_external_idp_refresh_response_handles_missing_refresh_token() {
+        // 非 rotating 模式（scope 没带 offline_access）时上游可能不回 refresh_token
+        let json = r#"{
+            "access_token": "eyJ.x",
+            "expires_in": 3600
+        }"#;
+        let parsed: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.access_token, "eyJ.x");
+        assert!(parsed.refresh_token.is_none());
+        assert_eq!(parsed.expires_in, Some(3600));
+    }
+
+    #[test]
     fn test_multi_token_manager_report_failure() {
         let config = Config::default();
         let cred1 = KiroCredentials::default();
@@ -2469,7 +3084,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2491,7 +3106,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -2535,7 +3150,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2575,7 +3190,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2644,6 +3259,7 @@ mod tests {
                 cache_read_tokens_total: 0,
                 cache_creation_tokens_total: 0,
                 output_tokens_total: 0,
+                consecutive_429_count: 0,
             });
         }
 
@@ -3063,7 +3679,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None)
+            .acquire_context(None, None)
             .await
             .err()
             .expect("应返回错误")
@@ -3251,5 +3867,99 @@ mod tests {
             !manager.report_failure(1),
             "cred1 已禁用且 cred2 在冷却中，应返回 false（无可用凭据）"
         );
+    }
+
+    #[test]
+    fn track_request_start_feeds_in_flight_and_window() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        let g1 = manager.track_request_start(1);
+        let g2 = manager.track_request_start(1);
+        assert_eq!(manager.in_flight.get(1), (2, 2));
+
+        let stats = manager.window_stats(1);
+        assert_eq!(stats.req_1m, 2, "track_request_start 应同时记入活动窗口");
+
+        drop(g1);
+        drop(g2);
+        assert_eq!(manager.in_flight.get(1), (0, 2));
+    }
+
+    #[test]
+    fn add_cost_feeds_token_window() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        manager.add_cost(1, "claude-sonnet-4-5", 1000, 200, 300, 50);
+        let stats = manager.window_stats(1);
+        assert_eq!(stats.tokens_in_1m, 1500, "input+cache_read+cache_creation 都是上游入量");
+        assert_eq!(stats.tokens_out_1m, 50);
+    }
+
+    #[test]
+    fn report_rate_limited_records_429_timestamp() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        assert_eq!(manager.window_stats(1).secs_since_last_429, None);
+        manager.report_rate_limited(1, StdDuration::from_secs(60));
+        let secs = manager.window_stats(1).secs_since_last_429;
+        assert!(matches!(secs, Some(0..=2)));
+    }
+
+    #[test]
+    fn build_observability_record_includes_all_fields() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        let _g = manager.track_request_start(1);
+        let r = manager.build_observability_record(
+            1,
+            "429_suspicious",
+            Some("claude-sonnet-4-5"),
+            Some(3),
+            Some(600),
+        );
+        assert_eq!(r.credential, 1);
+        assert_eq!(r.kind, "429_suspicious");
+        assert_eq!(r.in_flight, 1);
+        assert_eq!(r.req_1m, 1);
+        assert_eq!(r.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(r.attempt, Some(3));
+        assert_eq!(r.cooldown_secs, Some(600));
+        assert!(chrono::DateTime::parse_from_rfc3339(&r.ts).is_ok());
+    }
+
+    #[test]
+    fn baseline_records_skip_idle_credentials() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 仅凭据 1 有活动
+        let _g = manager.track_request_start(1);
+        let records = manager.baseline_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].credential, 1);
+        assert_eq!(records[0].kind, "baseline");
+        assert_eq!(records[0].attempt, None);
+    }
+
+    #[test]
+    fn snapshot_includes_in_flight_fields() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        let _g = manager.track_request_start(1);
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.in_flight, 1);
+        assert_eq!(e.in_flight_peak, 1);
     }
 }

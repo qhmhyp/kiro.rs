@@ -732,6 +732,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                       <th className="px-2 py-2 text-left font-medium">订阅</th>
                       <th className="px-2 py-2 text-left font-medium">优先级</th>
                       <th className="px-2 py-2 text-left font-medium">状态</th>
+                      <th className="px-2 py-2 text-left font-medium">并发</th>
                       <th className="px-2 py-2 text-left font-medium">计数 / 用量</th>
                       <th className="px-2 py-2 text-left font-medium">消耗金额</th>
                       <th className="px-2 py-2 text-left font-medium">最近使用</th>

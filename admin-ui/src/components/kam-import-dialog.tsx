@@ -30,9 +30,22 @@ interface KamAccount {
     region?: string
     authMethod?: string
     startUrl?: string
+    // External IdP 专用(KAM 1.1.2 嵌套格式直出)
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    profileArn?: string
+    accessToken?: string
+    expiresAt?: string | number
   }
   machineId?: string
   status?: string
+}
+
+function isExternalIdpAuthMethod(method?: string): boolean {
+  if (!method) return false
+  const m = method.toLowerCase()
+  return m === 'external_idp' || m === 'externalidp' || m === 'external-idp'
 }
 
 interface VerificationResult {
@@ -70,6 +83,16 @@ function normalizeKamAccount(item: unknown): unknown {
     const region = typeof obj.region === 'string' ? obj.region : undefined
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
+    // External IdP 字段
+    const tokenEndpoint = typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined
+    const issuerUrl = typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined
+    const scopes = typeof obj.scopes === 'string' ? obj.scopes : undefined
+    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
+    const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
+    const expiresAt =
+      typeof obj.expiresAt === 'string' || typeof obj.expiresAt === 'number'
+        ? (obj.expiresAt as string | number)
+        : undefined
 
     return {
       email,
@@ -84,6 +107,12 @@ function normalizeKamAccount(item: unknown): unknown {
         region,
         authMethod,
         startUrl,
+        tokenEndpoint,
+        issuerUrl,
+        scopes,
+        profileArn,
+        accessToken,
+        expiresAt,
       },
     }
   }
@@ -267,11 +296,23 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         try {
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const isExternalIdp = isExternalIdpAuthMethod(cred.authMethod)
+          // External IdP public client 的 clientSecret 可能是空字符串,不能用 clientSecret 推断 idc
+          const authMethod: 'social' | 'idc' | 'external_idp' = isExternalIdp
+            ? 'external_idp'
+            : (clientId && clientSecret ? 'idc' : 'social')
 
-          // idc 模式下必须同时提供 clientId 和 clientSecret
+          // idc 模式下必须同时提供 clientId 和 clientSecret(external_idp 不受此约束)
           if (authMethod === 'social' && (clientId || clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+          if (authMethod === 'external_idp') {
+            if (!cred.tokenEndpoint?.trim()) {
+              throw new Error('external_idp 必须提供 tokenEndpoint')
+            }
+            if (!clientId) {
+              throw new Error('external_idp 必须提供 clientId')
+            }
           }
 
           const addedCred = await addCredential({
@@ -281,6 +322,14 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
+            // External IdP 透传(其它 authMethod 全部 undefined)
+            tokenEndpoint: authMethod === 'external_idp' ? cred.tokenEndpoint?.trim() : undefined,
+            issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() : undefined,
+            scopes: authMethod === 'external_idp' ? cred.scopes?.trim() : undefined,
+            profileArn: authMethod === 'external_idp' ? cred.profileArn?.trim() : undefined,
+            accessToken: authMethod === 'external_idp' ? cred.accessToken?.trim() : undefined,
+            expiresAt: authMethod === 'external_idp' ? cred.expiresAt : undefined,
+            email: authMethod === 'external_idp' ? account.email?.trim() : undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -416,7 +465,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（authMethod 字段会被识别:social/idc 按 clientSecret 自动判断；external_idp 会读取 tokenEndpoint/issuerUrl/scopes/profileArn/accessToken/expiresAt 字段）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}\n\nExternal IdP（Microsoft Entra ID）KAM 嵌套格式也直接支持(credentials 内含 tokenEndpoint/scopes/profileArn 等)'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
