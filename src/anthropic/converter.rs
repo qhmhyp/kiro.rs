@@ -78,6 +78,7 @@ Complete all chunked operations without commentary.";
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
+/// - sonnet-5 → claude-sonnet-5
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
@@ -89,7 +90,10 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        // "sonnet-5" 不会误匹配 "sonnet-4-5"（后者是 "4-5" 而非 "-5" 直跟 sonnet）
+        if model_lower.contains("sonnet-5") {
+            Some("claude-sonnet-5".to_string())
+        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else {
             Some("claude-sonnet-4.5".to_string())
@@ -115,11 +119,12 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。Opus 4.7/4.8 同为 1M。
+/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。Opus 4.7/4.8、Sonnet 5 同为 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
-            if mapped == "claude-sonnet-4.6"
+            if mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -1053,6 +1058,50 @@ mod tests {
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4-8-thinking"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4.8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5() {
+        // Kiro 2026-06-30 上线 Sonnet 5，上游 ID 为 claude-sonnet-5（无小版本号）
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-20260630"),
+            Some("claude-sonnet-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_sonnet_5() {
+        // thinking 后缀不应影响 sonnet 5 模型映射
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5_no_false_match() {
+        // 回归：sonnet-4-5 / 3-5-sonnet 不应误匹配为 sonnet-5
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-3-5-sonnet-20241022"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_context_window_sonnet_5_is_1m() {
+        // Sonnet 5 上游为 1M 上下文（Kiro changelog 2026-07-01）
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5-thinking"), 1_000_000);
+        // sonnet 4.5 仍是 200k
+        assert_eq!(get_context_window_size("claude-sonnet-4-5-20250929"), 200_000);
     }
 
     #[test]

@@ -158,6 +158,24 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
+            id: "claude-sonnet-5".to_string(),
+            object: "model".to_string(),
+            created: 1782777600, // Jun 30, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-sonnet-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1782777600, // Jun 30, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
             created: 1779897600, // May 28, 2026
@@ -392,6 +410,10 @@ pub async fn post_messages(
         .unwrap_or(0);
     let convo_cache = state.convo_cache.clone();
 
+    // 检查是否启用了thinking（Sonnet 5 未传 thinking 字段时上游默认 adaptive，解析侧视为开启）
+    // 必须在 payload 字段被 move 之前计算
+    let thinking_enabled = thinking_enabled_for(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -399,13 +421,6 @@ pub async fn post_messages(
         payload.messages,
         payload.tools,
     ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -798,30 +813,42 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 按模型归一化 thinking 配置
 ///
-/// - Opus 4.6 / 4.7 / 4.8：覆写为 adaptive 类型 + OutputConfig{effort:"high"}
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// 1. 模型名含 "thinking" 后缀时覆写 thinking 配置：
+///    - Opus 4.6 / 4.7 / 4.8、Sonnet 5：覆写为 adaptive 类型 + OutputConfig{effort:"high"}
+///    - 其他模型：覆写为 enabled 类型，budget_tokens 固定为 20000
+/// 2. Sonnet 5 显式传 thinking.enabled 时改写为 adaptive：
+///    Sonnet 5 已移除 manual extended thinking，enabled 会被上游 400 拒绝。
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    if !payload.model.to_lowercase().contains("thinking") {
-        return;
-    }
-
-    // Opus 4.6 起引入 adaptive thinking，4.7/4.8 同系列沿用同一处理。
+    // adaptive thinking 模型集合：Opus 4.6 引入，4.7/4.8 沿用；Sonnet 5 仅支持 adaptive。
     // 派生自 map_model 的输出，确保与请求实际落地的上游模型一致：
     // 避免如 `claude-opus-4-5-rev-4-8-thinking` 这种 map_model 命中 4.5
     // 但本处又命中 "4-8" 子串导致 adaptive 与 4.5 不兼容的差异 bug。
-    let is_opus_adaptive = matches!(
+    let is_adaptive = matches!(
         map_model(&payload.model).as_deref(),
-        Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8")
+        Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-5")
     );
+    let is_sonnet_5 = matches!(map_model(&payload.model).as_deref(), Some("claude-sonnet-5"));
 
-    let thinking_type = if is_opus_adaptive {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    if !payload.model.to_lowercase().contains("thinking") {
+        // Sonnet 5 不接受 enabled 类型（manual extended thinking 已移除），改写为
+        // adaptive；effort 交由 converter 兜底（无 output_config 时默认 high）。
+        if is_sonnet_5 {
+            if let Some(t) = payload.thinking.as_mut() {
+                if t.thinking_type == "enabled" {
+                    tracing::info!(
+                        model = %payload.model,
+                        "Sonnet 5 不支持 enabled thinking，改写为 adaptive"
+                    );
+                    t.thinking_type = "adaptive".to_string();
+                }
+            }
+        }
+        return;
+    }
+
+    let thinking_type = if is_adaptive { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -834,10 +861,22 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_adaptive {
+    if is_adaptive {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
+    }
+}
+
+/// 判断解析侧是否应启用 thinking 块提取
+///
+/// Sonnet 5 在请求未携带 thinking 字段时上游仍默认开启 adaptive thinking，
+/// 响应照常输出 `<thinking>` 标签；若解析侧视为关闭，思考内容会混入 text 块。
+/// 因此 Sonnet 5 无 thinking 字段时默认视为开启（无标签时解析器会正常走 text 路径，无副作用）。
+fn thinking_enabled_for(payload: &MessagesRequest) -> bool {
+    match payload.thinking.as_ref() {
+        Some(t) => t.is_enabled(),
+        None => matches!(map_model(&payload.model).as_deref(), Some("claude-sonnet-5")),
     }
 }
 
@@ -969,6 +1008,10 @@ pub async fn post_messages_cc(
         .unwrap_or(0);
     let convo_cache = state.convo_cache.clone();
 
+    // 检查是否启用了thinking（Sonnet 5 未传 thinking 字段时上游默认 adaptive，解析侧视为开启）
+    // 必须在 payload 字段被 move 之前计算
+    let thinking_enabled = thinking_enabled_for(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -976,13 +1019,6 @@ pub async fn post_messages_cc(
         payload.messages,
         payload.tools,
     ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -1364,5 +1400,71 @@ mod tests {
         override_thinking_from_model_name(&mut p);
         assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "enabled");
         assert!(p.output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_override_sonnet_5_uses_adaptive() {
+        // Sonnet 5 仅支持 adaptive thinking，-thinking 后缀应走 adaptive + effort:high
+        let mut p = req_with_model("claude-sonnet-5-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "adaptive");
+        assert_eq!(p.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn thinking_enabled_rewritten_to_adaptive_for_sonnet_5() {
+        // Sonnet 5 已移除 manual extended thinking，客户端显式传 enabled 会被上游 400，
+        // 应改写为 adaptive；不注入 output_config（converter 兜底 effort:high）
+        let mut p: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1000,
+            "messages": [],
+            "thinking": { "type": "enabled", "budget_tokens": 20000 },
+        }))
+        .unwrap();
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "adaptive");
+        assert!(p.output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_enabled_not_rewritten_for_other_models() {
+        // 回归：非 Sonnet 5 模型显式传 enabled 应保持原样
+        let mut p: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1000,
+            "messages": [],
+            "thinking": { "type": "enabled", "budget_tokens": 20000 },
+        }))
+        .unwrap();
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "enabled");
+    }
+
+    #[test]
+    fn thinking_disabled_kept_for_sonnet_5() {
+        // 显式 disabled 不应被改写为 adaptive
+        let mut p: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1000,
+            "messages": [],
+            "thinking": { "type": "disabled" },
+        }))
+        .unwrap();
+        override_thinking_from_model_name(&mut p);
+        assert_eq!(p.thinking.as_ref().unwrap().thinking_type, "disabled");
+    }
+
+    #[test]
+    fn thinking_enabled_for_defaults_true_on_sonnet_5() {
+        // Sonnet 5 未传 thinking 字段时上游默认 adaptive thinking，
+        // 解析侧应视为开启，否则 <thinking> 内容会混入 text 块
+        let p = req_with_model("claude-sonnet-5");
+        assert!(thinking_enabled_for(&p));
+        // 其他模型未传 thinking 字段时维持关闭
+        let p = req_with_model("claude-sonnet-4-6");
+        assert!(!thinking_enabled_for(&p));
+        let p = req_with_model("claude-opus-4-8");
+        assert!(!thinking_enabled_for(&p));
     }
 }
