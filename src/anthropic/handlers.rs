@@ -410,9 +410,11 @@ pub async fn post_messages(
         .unwrap_or(0);
     let convo_cache = state.convo_cache.clone();
 
-    // 检查是否启用了thinking（Sonnet 5 未传 thinking 字段时上游默认 adaptive，解析侧视为开启）
-    // 必须在 payload 字段被 move 之前计算
-    let thinking_enabled = thinking_enabled_for(&payload);
+    // thinking 提取闸门：请求显式启用 thinking（enabled/adaptive）且运维未关闭 extract_thinking。
+    // 流式与非流式共用同一闸门——否则 extract_thinking=false 只约束非流式，流式仍会探测
+    // <thinking>，运维用来规避"裸标签吞答案"的 kill-switch 对流式失效。
+    // 必须在 payload 字段被 move 之前计算。
+    let thinking_enabled = state.extract_thinking && thinking_enabled_for(&payload);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -439,14 +441,13 @@ pub async fn post_messages(
         )
         .await
     } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        // 非流式响应：thinking_enabled 已含 extract_thinking 闸门
         handle_non_stream_request(
             provider,
             &request_body,
             &payload.model,
             input_tokens,
-            extract_thinking,
+            thinking_enabled,
             tool_name_map,
             convo_cache,
             conversation_id,
@@ -825,11 +826,14 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     // 派生自 map_model 的输出，确保与请求实际落地的上游模型一致：
     // 避免如 `claude-opus-4-5-rev-4-8-thinking` 这种 map_model 命中 4.5
     // 但本处又命中 "4-8" 子串导致 adaptive 与 4.5 不兼容的差异 bug。
-    let is_adaptive = matches!(
-        map_model(&payload.model).as_deref(),
-        Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-5")
-    );
-    let is_sonnet_5 = matches!(map_model(&payload.model).as_deref(), Some("claude-sonnet-5"));
+    // 单次查询即可：is_sonnet_5 是 is_adaptive 的真子集。
+    let mapped = map_model(&payload.model);
+    let is_sonnet_5 = mapped.as_deref() == Some("claude-sonnet-5");
+    let is_adaptive = is_sonnet_5
+        || matches!(
+            mapped.as_deref(),
+            Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8")
+        );
 
     if !payload.model.to_lowercase().contains("thinking") {
         // Sonnet 5 不接受 enabled 类型（manual extended thinking 已移除），改写为
@@ -1012,9 +1016,10 @@ pub async fn post_messages_cc(
         .unwrap_or(0);
     let convo_cache = state.convo_cache.clone();
 
-    // 检查是否启用了thinking（Sonnet 5 未传 thinking 字段时上游默认 adaptive，解析侧视为开启）
-    // 必须在 payload 字段被 move 之前计算
-    let thinking_enabled = thinking_enabled_for(&payload);
+    // thinking 提取闸门：与 /v1/messages 同一策略——请求显式启用 thinking 且运维未关闭
+    // extract_thinking，流式与非流式共用，避免 kill-switch 对流式失效。
+    // 必须在 payload 字段被 move 之前计算。
+    let thinking_enabled = state.extract_thinking && thinking_enabled_for(&payload);
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -1041,14 +1046,13 @@ pub async fn post_messages_cc(
         )
         .await
     } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        // 非流式响应：thinking_enabled 已含 extract_thinking 闸门
         handle_non_stream_request(
             provider,
             &request_body,
             &payload.model,
             input_tokens,
-            extract_thinking,
+            thinking_enabled,
             tool_name_map,
             convo_cache,
             conversation_id,
