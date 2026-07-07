@@ -1596,6 +1596,63 @@ mod tests {
         );
     }
 
+    /// 回归:plain 请求(thinking_enabled=false,如修复后的 plain Sonnet 5)下,
+    /// 模型可见回答里裸露的 `<thinking>` 必须原样透传为 text,不得被当成思考块吞掉。
+    /// 这是 thinking_enabled_for 不再对 plain Sonnet 5 默认开启的行为保证。
+    #[test]
+    fn test_literal_thinking_tag_passes_through_when_disabled() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let answer = "The model uses <thinking> tags to reason, then closes with </thinking>.\n\nAnswer: 42.";
+        let events = ctx.process_assistant_response(answer);
+
+        let emitted: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+
+        assert_eq!(emitted, answer, "裸 <thinking> 应原样透传,不被吞");
+        // 不应产生任何 thinking 块
+        assert!(
+            events
+                .iter()
+                .all(|e| e.data["content_block"]["type"] != "thinking"),
+            "disabled 模式不应创建 thinking 块"
+        );
+    }
+
+    /// 对照:同样内容在 thinking_enabled=true 下会被误吞——证明修复(不默认开启)的必要性。
+    /// 注:`</thinking>.` 后跟句号(句号在 QUOTE_CHARS)使结束标签永不被识别,
+    /// 整段答案(含 flush)被吞进 thinking 块,可见 text 只剩标签前缀。
+    #[test]
+    fn test_literal_thinking_tag_gets_eaten_when_enabled() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let answer = "The model uses <thinking> tags to reason, then closes with </thinking>.\n\nAnswer: 42.";
+        let mut events = ctx.process_assistant_response(answer);
+        events.extend(ctx.generate_final_events()); // flush 出被暂存的 thinking 内容
+
+        let text: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        let thinking: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+
+        // enabled 模式下 "Answer: 42." 从可见 text 消失、落入 thinking 块——
+        // 正是 plain Sonnet 5 默认开启会造成的静默丢答案。
+        assert!(text.starts_with("The model uses "));
+        assert!(!text.contains("Answer: 42."), "可见 text 不应包含被吞的答案");
+        assert!(thinking.contains("Answer: 42."), "答案被误吞进 thinking 块");
+    }
+
     #[test]
     fn test_estimate_tokens() {
         assert!(estimate_tokens("Hello") > 0);

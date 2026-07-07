@@ -62,6 +62,10 @@ impl PricingTable {
         table.insert("claude-opus-4".to_string(), opus);
         table.insert("claude-sonnet-4".to_string(), sonnet);
         table.insert("claude-haiku-4".to_string(), haiku);
+        // Sonnet 5：Sonnet 档挂牌价（$3/$15）。显式插入避免依赖 fallback——
+        // "claude-sonnet-5" 不以 "claude-sonnet-4" 为前缀，无显式档会静默落 fallback，
+        // 后续若上游调价或 fallback 改动会导致 Sonnet 5 计费漂移。
+        table.insert("claude-sonnet-5".to_string(), sonnet);
         // 未知模型兜底取 sonnet 档（避免低估）
         Self { table, fallback: sonnet }
     }
@@ -185,6 +189,17 @@ mod tests {
     fn test_negative_tokens_clamped() {
         let t = PricingTable::builtin();
         assert_eq!(t.cost_usd("claude-sonnet-4-6", -5, -5, -5, -5), 0.0);
+    }
+
+    #[test]
+    fn test_sonnet_5_resolves_to_sonnet_tier() {
+        let t = PricingTable::builtin();
+        // claude-sonnet-5 不以 claude-sonnet-4 为前缀,需显式档命中 Sonnet 价($3/$15)
+        let cost = t.cost_usd("claude-sonnet-5", 1_000_000, 0, 0, 1_000_000);
+        assert!((cost - (3.0 + 15.0)).abs() < 1e-6, "got {cost}");
+        // -thinking 变体归一化后同档
+        let cost2 = t.cost_usd("claude-sonnet-5-thinking", 1_000_000, 0, 0, 0);
+        assert!((cost2 - 3.0).abs() < 1e-6, "got {cost2}");
     }
 
     #[test]

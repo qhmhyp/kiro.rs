@@ -870,14 +870,18 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
 /// 判断解析侧是否应启用 thinking 块提取
 ///
-/// Sonnet 5 在请求未携带 thinking 字段时上游仍默认开启 adaptive thinking，
-/// 响应照常输出 `<thinking>` 标签；若解析侧视为关闭，思考内容会混入 text 块。
-/// 因此 Sonnet 5 无 thinking 字段时默认视为开启（无标签时解析器会正常走 text 路径，无副作用）。
+/// 仅当请求显式携带启用的 thinking 配置（enabled / adaptive）时才开启探测。
+///
+/// 注意：**不**对无 thinking 字段的 Sonnet 5 默认开启。曾有假设称 Sonnet 5 在
+/// 未传 thinking 字段时上游仍默认 adaptive 并输出 `<thinking>`，需解析侧默认开启
+/// 以拆分。但对本代理（Kiro/CodeWhisperer 上游）的实测表明：plain Sonnet 5（含
+/// 复杂推理题）在默认路径**从不输出 `<thinking>` 标签**。默认开启不仅无收益，还会
+/// 把探测逻辑施加到普通回答上——当模型可见回答里出现裸露的 `<thinking>`（如散文中
+/// 提及该标签、非反引号包裹）时，会被误判为思考块，导致其后整段答案被吞、
+/// stop_reason 被改成 max_tokens（静默丢答案）。故普通请求一律直通，与 Sonnet 4.6 一致。
+/// 显式 thinking 请求（含 `-thinking` 后缀、enabled→adaptive 改写）仍会开启探测。
 fn thinking_enabled_for(payload: &MessagesRequest) -> bool {
-    match payload.thinking.as_ref() {
-        Some(t) => t.is_enabled(),
-        None => matches!(map_model(&payload.model).as_deref(), Some("claude-sonnet-5")),
-    }
+    payload.thinking.as_ref().map(|t| t.is_enabled()).unwrap_or(false)
 }
 
 /// POST /v1/messages/count_tokens
@@ -1456,15 +1460,47 @@ mod tests {
     }
 
     #[test]
-    fn thinking_enabled_for_defaults_true_on_sonnet_5() {
-        // Sonnet 5 未传 thinking 字段时上游默认 adaptive thinking，
-        // 解析侧应视为开启，否则 <thinking> 内容会混入 text 块
+    fn thinking_enabled_for_plain_sonnet_5_is_false() {
+        // 无 thinking 字段的 plain Sonnet 5 走安全直通(与 Sonnet 4.6 一致),
+        // 不主动探测 <thinking>,避免可见回答里的裸标签被误吞。
+        // 实测:Kiro 上游 plain Sonnet 5 默认路径不输出 <thinking>,默认开启无收益。
         let p = req_with_model("claude-sonnet-5");
-        assert!(thinking_enabled_for(&p));
-        // 其他模型未传 thinking 字段时维持关闭
+        assert!(!thinking_enabled_for(&p));
         let p = req_with_model("claude-sonnet-4-6");
         assert!(!thinking_enabled_for(&p));
         let p = req_with_model("claude-opus-4-8");
         assert!(!thinking_enabled_for(&p));
+    }
+
+    #[test]
+    fn thinking_enabled_for_explicit_thinking_is_true() {
+        // 显式 thinking 请求(enabled / adaptive)开启探测;disabled 不开启。
+        for ty in ["enabled", "adaptive"] {
+            let p: MessagesRequest = serde_json::from_value(json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 1000,
+                "messages": [],
+                "thinking": { "type": ty, "budget_tokens": 20000 },
+            }))
+            .unwrap();
+            assert!(thinking_enabled_for(&p), "type={} 应开启", ty);
+        }
+        let p: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1000,
+            "messages": [],
+            "thinking": { "type": "disabled" },
+        }))
+        .unwrap();
+        assert!(!thinking_enabled_for(&p));
+    }
+
+    #[test]
+    fn thinking_enabled_for_sonnet_5_thinking_suffix_after_override() {
+        // -thinking 后缀经 override_thinking_from_model_name 覆写为 adaptive 后,
+        // thinking_enabled_for 应返回 true(探测开启)。
+        let mut p = req_with_model("claude-sonnet-5-thinking");
+        override_thinking_from_model_name(&mut p);
+        assert!(thinking_enabled_for(&p));
     }
 }
