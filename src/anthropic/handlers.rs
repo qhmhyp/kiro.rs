@@ -822,22 +822,20 @@ async fn handle_non_stream_request(
 /// 2. Sonnet 5 显式传 thinking.enabled 时改写为 adaptive：
 ///    Sonnet 5 已移除 manual extended thinking，enabled 会被上游 400 拒绝。
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    // adaptive thinking 模型集合：Opus 4.6 引入，4.7/4.8 沿用；Sonnet 5 仅支持 adaptive。
     // 派生自 map_model 的输出，确保与请求实际落地的上游模型一致：
     // 避免如 `claude-opus-4-5-rev-4-8-thinking` 这种 map_model 命中 4.5
     // 但本处又命中 "4-8" 子串导致 adaptive 与 4.5 不兼容的差异 bug。
-    // 单次查询即可：is_sonnet_5 是 is_adaptive 的真子集。
     let mapped = map_model(&payload.model);
     let is_sonnet_5 = mapped.as_deref() == Some("claude-sonnet-5");
-    let is_adaptive = is_sonnet_5
-        || matches!(
-            mapped.as_deref(),
-            Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8")
-        );
 
     if !payload.model.to_lowercase().contains("thinking") {
-        // Sonnet 5 不接受 enabled 类型（manual extended thinking 已移除），改写为
-        // adaptive；effort 交由 converter 兜底（无 output_config 时默认 high）。
+        // Sonnet 5 不接受 enabled 类型（manual extended thinking 已移除），改写为 adaptive。
+        // 局限：adaptive 只有 effort 档位、没有 budget 旋钮，客户端 enabled 模式下的
+        // budget_tokens（思考量意图）无法映射过来；effort 交由 converter 兜底（无
+        // output_config 时默认 high）。即客户端若显式传小 budget 期望"少思考"，此处
+        // 无法降档，仍走 high。若客户端自带 output_config.effort 则保留其值（本处不覆写）。
+        // 未按 budget 降档是刻意选择：Kiro Sonnet 5 的 effort 合法档位未经实测确认，
+        // 猜测 low/medium 有触发上游 400 的风险，high 为已实测可用值。
         if is_sonnet_5 {
             if let Some(t) = payload.thinking.as_mut() {
                 if t.thinking_type == "enabled" {
@@ -851,6 +849,14 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         }
         return;
     }
+
+    // 以下仅 `-thinking` 后缀路径可达。adaptive thinking 模型集合：Opus 4.6 引入，
+    // 4.7/4.8 沿用；Sonnet 5 仅支持 adaptive（is_sonnet_5 是 is_adaptive 的真子集）。
+    let is_adaptive = is_sonnet_5
+        || matches!(
+            mapped.as_deref(),
+            Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8")
+        );
 
     let thinking_type = if is_adaptive { "adaptive" } else { "enabled" };
 
