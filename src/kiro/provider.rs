@@ -492,8 +492,8 @@ impl KiroProvider {
                 );
 
                 if is_suspicious {
-                    let cooldown = Duration::from_secs(600);
-                    let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                    // 风控类：立即冷却 10 分钟；连续达阈值则自动禁用（report_suspicious 内处理）
+                    let has_available = self.token_manager.report_suspicious(ctx.id);
                     if !has_available {
                         return Err(self.upstream_error_for(Some(429), &body, ctx.id)
                             .exhausted()
@@ -741,16 +741,15 @@ impl KiroProvider {
                 );
 
                 if is_suspicious {
-                    // 风控类：立即冷却 10 分钟
-                    let cooldown = Duration::from_secs(600);
+                    // 风控类：立即冷却 10 分钟；连续达阈值则自动禁用（report_suspicious 内处理）
                     self.token_manager.log_rate_limit_incident(
                         ctx.id,
                         "429_suspicious",
                         model.as_deref(),
                         attempt as u32 + 1,
-                        Some(cooldown.as_secs()),
+                        Some(600),
                     );
-                    let has_available = self.token_manager.report_rate_limited(ctx.id, cooldown);
+                    let has_available = self.token_manager.report_suspicious(ctx.id);
                     if !has_available {
                         return Err(self.upstream_error_for(Some(429), &body, ctx.id)
                             .exhausted()

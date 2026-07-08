@@ -612,6 +612,9 @@ struct CredentialEntry {
     output_tokens_total: u64,
     /// 连续 429 计数:累计 5 次才冷却,避免偶发 429 导致不必要的故障转移和级联
     consecutive_429_count: u32,
+    /// 连续风控(suspicious activity)计数:累计 3 次自动禁用,把持续被风控的凭据
+    /// 彻底移出轮转,避免其反复回来消耗请求并把负载级联到健康凭据。成功一次即清零。
+    consecutive_suspicious_count: u32,
 }
 
 /// 凭据最近一次上游错误（用于状态展示）
@@ -667,6 +670,8 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 连续被上游风控（suspicious activity）达到阈值后自动禁用
+    RiskControl,
 }
 
 /// 统计数据持久化条目
@@ -806,6 +811,10 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 每个凭据最大连续风控（suspicious activity）次数，达到后自动禁用
+const MAX_SUSPICIOUS_PER_CREDENTIAL: u32 = 3;
+/// 风控类 429 的固定冷却时长（秒）。风控不受可配的普通 429 冷却影响，固定 10 分钟。
+const SUSPICIOUS_COOLDOWN_SECS: i64 = 600;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -894,6 +903,7 @@ impl MultiTokenManager {
                     cache_creation_tokens_total: 0,
                     output_tokens_total: 0,
                     consecutive_429_count: 0,
+                    consecutive_suspicious_count: 0,
                 }
             })
             .collect();
@@ -1519,6 +1529,7 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.consecutive_429_count = 0;
+                entry.consecutive_suspicious_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功一次后清空"最近错误"，状态徽章回归正常
@@ -1873,6 +1884,81 @@ impl MultiTokenManager {
         has_available
     }
 
+    /// 报告指定凭据被上游风控（响应体含 "suspicious activity"）。
+    ///
+    /// 与普通 429 不同：风控**立即**冷却 [`SUSPICIOUS_COOLDOWN_SECS`]（10 分钟），并累计
+    /// 连续次数——达到 [`MAX_SUSPICIOUS_PER_CREDENTIAL`] 后**自动禁用并持久化**（原因
+    /// [`DisabledReason::RiskControl`]），把持续被风控的凭据彻底移出轮转，避免它每次冷却
+    /// 到期后回来消耗请求、并把负载级联到健康凭据。任意一次成功（[`Self::report_success`]）
+    /// 都会清零连续计数，因此偶发风控不会误伤。被禁用后需手动恢复。
+    ///
+    /// # Returns
+    /// 调用后是否还有可用凭据（未禁用且未冷却），供调用方判断是否继续切换重试。
+    pub fn report_suspicious(&self, id: u64) -> bool {
+        let (has_available, just_disabled) = {
+            let mut entries = self.entries.lock();
+            let now = Utc::now();
+            let until = now + Duration::seconds(SUSPICIOUS_COOLDOWN_SECS);
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return any_entry_available(&entries),
+            };
+            if entry.disabled {
+                return any_entry_available(&entries);
+            }
+
+            // 始终冷却（即便未达禁用阈值）
+            entry.cooldown_until = Some(until);
+            entry.last_used_at = Some(now.to_rfc3339());
+            entry.consecutive_suspicious_count += 1;
+            let count = entry.consecutive_suspicious_count;
+
+            let mut just_disabled = false;
+            if count >= MAX_SUSPICIOUS_PER_CREDENTIAL {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::RiskControl);
+                just_disabled = true;
+            }
+            // entry 的可变借用到此结束（下面不再使用 entry），可安全只读遍历 entries
+
+            if just_disabled {
+                tracing::error!(
+                    "凭据 #{} 连续被上游风控 {} 次，已自动禁用（需手动恢复）",
+                    id,
+                    count
+                );
+                if !any_entry_available(&entries) {
+                    tracing::error!("所有凭据均不可用（已禁用或冷却中）！");
+                }
+            } else {
+                tracing::warn!(
+                    "凭据 #{} 被上游风控（{}/{}），冷却 {} 秒至 {}",
+                    id,
+                    count,
+                    MAX_SUSPICIOUS_PER_CREDENTIAL,
+                    SUSPICIOUS_COOLDOWN_SECS,
+                    until.to_rfc3339()
+                );
+            }
+
+            (any_entry_available(&entries), just_disabled)
+        };
+
+        // entries 锁释放后再取 activity 锁，符合锁序约束
+        self.activity
+            .lock()
+            .entry(id)
+            .or_default()
+            .record_429(Utc::now());
+
+        if just_disabled && let Err(e) = self.persist_credentials() {
+            tracing::warn!("风控自动禁用后持久化失败（不影响本次请求）: {}", e);
+        }
+        self.save_stats_debounced();
+        has_available
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据，与 API 401/403 的累计失败策略一致；
@@ -2046,6 +2132,7 @@ impl MultiTokenManager {
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
+                        DisabledReason::RiskControl => "RiskControl",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
                     name: e.credentials.name.clone(),
@@ -2079,6 +2166,7 @@ impl MultiTokenManager {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.consecutive_suspicious_count = 0;
                 entry.disabled_reason = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
@@ -2196,6 +2284,7 @@ impl MultiTokenManager {
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
+            entry.consecutive_suspicious_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
             // 重置状态时一并清掉最近错误，状态徽章回归"正常"
@@ -2499,6 +2588,7 @@ impl MultiTokenManager {
                 cache_creation_tokens_total: 0,
                 output_tokens_total: 0,
                 consecutive_429_count: 0,
+                consecutive_suspicious_count: 0,
             });
         }
 
@@ -3019,6 +3109,106 @@ mod tests {
     }
 
     #[test]
+    fn test_report_suspicious_auto_disables_after_threshold() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let reason = |m: &MultiTokenManager, id: u64| {
+            m.snapshot()
+                .entries
+                .into_iter()
+                .find(|e| e.id == id)
+                .map(|e| (e.disabled, e.disabled_reason, e.cooldown_until))
+                .unwrap()
+        };
+
+        // 前两次风控：仅冷却，不禁用（disabled=false，但已设 cooldown_until）
+        assert!(manager.report_suspicious(1));
+        assert!(manager.report_suspicious(1));
+        let (disabled, dr, cd) = reason(&manager, 1);
+        assert!(!disabled, "两次风控不应禁用");
+        assert_eq!(dr, None);
+        assert!(cd.is_some(), "风控应立即冷却");
+
+        // 第三次风控：自动禁用，原因 RiskControl
+        assert!(manager.report_suspicious(1));
+        let (disabled, dr, _) = reason(&manager, 1);
+        assert!(disabled, "连续 3 次风控应自动禁用");
+        assert_eq!(dr.as_deref(), Some("RiskControl"));
+
+        // 另一个凭据仍可用，未被连累
+        let (disabled2, _, _) = reason(&manager, 2);
+        assert!(!disabled2);
+    }
+
+    #[test]
+    fn test_report_suspicious_reset_by_success() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        // 两次风控后成功一次 → 连续计数清零
+        manager.report_suspicious(1);
+        manager.report_suspicious(1);
+        manager.report_success(1);
+
+        // 再两次风控：若计数未清零(此时应为 4)早已禁用；清零后为 2，仍不禁用
+        manager.report_suspicious(1);
+        manager.report_suspicious(1);
+        let disabled = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .disabled;
+        assert!(!disabled, "成功应清零风控连续计数，偶发风控不误伤");
+    }
+
+    #[test]
+    fn test_report_suspicious_count_cleared_on_reenable() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        // 连续 3 次禁用
+        manager.report_suspicious(1);
+        manager.report_suspicious(1);
+        manager.report_suspicious(1);
+        assert!(
+            manager
+                .snapshot()
+                .entries
+                .into_iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .disabled
+        );
+
+        // 手动恢复应清零连续计数：恢复后再 2 次风控不应立即禁用（证明计数已归零）
+        manager.reset_and_enable(1).unwrap();
+        manager.report_suspicious(1);
+        manager.report_suspicious(1);
+        let disabled = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .disabled;
+        assert!(!disabled, "reset_and_enable 应清零风控连续计数");
+    }
+
+    #[test]
     fn test_add_cost_accumulates() {
         let config = Config::default();
         let cred = KiroCredentials::default();
@@ -3260,6 +3450,7 @@ mod tests {
                 cache_creation_tokens_total: 0,
                 output_tokens_total: 0,
                 consecutive_429_count: 0,
+                consecutive_suspicious_count: 0,
             });
         }
 
