@@ -54,6 +54,8 @@ pub struct CredentialStatusItem {
     pub in_flight: u32,
     /// 进程启动以来最高瞬时并发
     pub in_flight_peak: u32,
+    /// 近 60s 上游请求数（达到每分钟上限时该凭据暂不参与调度）
+    pub req_1m: u32,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理

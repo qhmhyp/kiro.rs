@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialsUnavailableError, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -370,6 +370,12 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
+                    // 池级不可用（全部禁用/冷却/RPM 达限）：立即 429 + Retry-After，不再空转重试
+                    if e.downcast_ref::<CredentialsUnavailableError>().is_some() {
+                        return Err(UpstreamError::new(Some(429), &e.to_string(), 0)
+                            .exhausted()
+                            .into_anyhow());
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -583,6 +589,12 @@ impl KiroProvider {
             {
                 Ok(c) => c,
                 Err(e) => {
+                    // 池级不可用（全部禁用/冷却/RPM 达限）：立即 429 + Retry-After，不再空转重试
+                    if e.downcast_ref::<CredentialsUnavailableError>().is_some() {
+                        return Err(UpstreamError::new(Some(429), &e.to_string(), 0)
+                            .exhausted()
+                            .into_anyhow());
+                    }
                     last_error = Some(e);
                     continue;
                 }

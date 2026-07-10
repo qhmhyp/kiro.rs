@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,6 +112,26 @@ impl fmt::Display for RefreshTokenInvalidError {
 }
 
 impl std::error::Error for RefreshTokenInvalidError {}
+
+/// 凭据池当前无可调度凭据（全部已禁用、冷却中或达到每分钟请求上限）。
+///
+/// provider 据此立即向客户端返回 429 + Retry-After，而非继续重试循环。
+#[derive(Debug)]
+pub(crate) struct CredentialsUnavailableError {
+    pub total: usize,
+}
+
+impl fmt::Display for CredentialsUnavailableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "所有凭据均不可用（已禁用、冷却中或达到每分钟请求上限，0/{}）",
+            self.total
+        )
+    }
+}
+
+impl std::error::Error for CredentialsUnavailableError {}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -761,6 +781,8 @@ pub struct CredentialEntrySnapshot {
     pub in_flight: u32,
     /// 进程启动以来最高瞬时并发
     pub in_flight_peak: u32,
+    /// 近 60s 上游请求数(达到 MAX_REQUESTS_PER_MINUTE 时该凭据暂不参与调度)
+    pub req_1m: u32,
 }
 
 /// 凭据管理器状态快照
@@ -811,6 +833,9 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 每凭据每分钟最大上游请求数（滚动 60s 窗口，基于 ActivityWindow.req_1m）。
+/// 软上限：并发获取与 track_request_start 之间存在竞态，突发时短暂超出可接受。
+const MAX_REQUESTS_PER_MINUTE: u32 = 5;
 /// 每个凭据最大连续风控（suspicious activity）次数，达到后自动禁用
 const MAX_SUSPICIOUS_PER_CREDENTIAL: u32 = 3;
 /// 风控类 429 的固定冷却时长（秒）。风控不受可配的普通 429 冷却影响，固定 10 分钟。
@@ -1058,6 +1083,8 @@ impl MultiTokenManager {
     /// 在 `entries` 写锁内完成「过滤 + 选择 + 打点」三步，保证两个并发调用一定看到
     /// 不同的 `last_used_at`，从而落到不同凭据上（前提是同组有 ≥ 2 条可用）
     fn acquire_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+        // 锁序：RPM 判定集合必须在取 entries 锁之前算好（activity 锁与 entries 锁互斥持有）
+        let rpm_capped = self.rpm_capped_ids();
         let result = {
             let mut entries = self.entries.lock();
 
@@ -1070,6 +1097,7 @@ impl MultiTokenManager {
                 !e.disabled
                     && e.cooldown_until.map_or(true, |t| now >= t)
                     && (!is_opus || e.credentials.supports_opus())
+                    && !rpm_capped.contains(&e.id)
             };
 
             // 1) 取所有可用凭据中最小的 priority
@@ -1102,18 +1130,22 @@ impl MultiTokenManager {
     ) -> Option<(u64, KiroCredentials)> {
         if let Some(conv_id) = conversation_id {
             if let Some(sticky_id) = self.convo_sticky.get(conv_id) {
+                // 锁序：RPM 判定须在取 entries 锁之前完成
+                let sticky_rpm_capped =
+                    self.window_stats(sticky_id).req_1m >= MAX_REQUESTS_PER_MINUTE;
                 let mut entries = self.entries.lock();
                 let is_opus = model
                     .map(|m| m.to_lowercase().contains("opus"))
                     .unwrap_or(false);
                 let now = Utc::now();
 
-                let usable = entries.iter().any(|e| {
-                    e.id == sticky_id
-                        && !e.disabled
-                        && e.cooldown_until.map_or(true, |t| now >= t)
-                        && (!is_opus || e.credentials.supports_opus())
-                });
+                let usable = !sticky_rpm_capped
+                    && entries.iter().any(|e| {
+                        e.id == sticky_id
+                            && !e.disabled
+                            && e.cooldown_until.map_or(true, |t| now >= t)
+                            && (!is_opus || e.credentials.supports_opus())
+                    });
 
                 if usable {
                     if let Some(chosen) = entries.iter_mut().find(|e| e.id == sticky_id) {
@@ -1207,10 +1239,10 @@ impl MultiTokenManager {
                     if self.self_heal_too_many_failures() {
                         match self.acquire_credential_sticky(model, conversation_id) {
                             Some(x) => x,
-                            None => anyhow::bail!("所有凭据均不可用（已禁用或冷却中，0/{}）", total),
+                            None => return Err(CredentialsUnavailableError { total }.into()),
                         }
                     } else {
-                        anyhow::bail!("所有凭据均不可用（已禁用或冷却中，0/{}）", total);
+                        return Err(CredentialsUnavailableError { total }.into());
                     }
                 }
             };
@@ -1235,7 +1267,7 @@ impl MultiTokenManager {
                         };
                     attempt_count += 1;
                     if !has_available {
-                        anyhow::bail!("所有凭据均不可用（已禁用或冷却中，0/{}）", total);
+                        return Err(CredentialsUnavailableError { total }.into());
                     }
                 }
             }
@@ -1564,6 +1596,19 @@ impl MultiTokenManager {
             .get_mut(&id)
             .map(|w| w.stats(Utc::now()))
             .unwrap_or_default()
+    }
+
+    /// 预计算当前已达 RPM 上限的凭据 ID 集合。
+    /// 锁序：只持 activity 锁，调用方必须在取 entries 锁之前调用（见字段注释）。
+    fn rpm_capped_ids(&self) -> HashSet<u64> {
+        let now = Utc::now();
+        self.activity
+            .lock()
+            .iter_mut()
+            .filter_map(|(id, w)| {
+                (w.stats(now).req_1m >= MAX_REQUESTS_PER_MINUTE).then_some(*id)
+            })
+            .collect()
     }
 
     /// 组装一条观测记录(事故快照与基线采样共用)
@@ -2066,6 +2111,15 @@ impl MultiTokenManager {
     /// 没有任何 entry 被选中过时为 0。该字段仅用于前端展示，不参与调度。
     pub fn snapshot(&self) -> ManagerSnapshot {
         let in_flight = self.in_flight.snapshot();
+        // 锁序：activity 锁先于 entries 锁单独取用
+        let req_1m_by_id: HashMap<u64, u32> = {
+            let now = Utc::now();
+            self.activity
+                .lock()
+                .iter_mut()
+                .map(|(id, w)| (*id, w.stats(now).req_1m))
+                .collect()
+        };
         let entries = self.entries.lock();
         let current_id = entries
             .iter()
@@ -2145,6 +2199,7 @@ impl MultiTokenManager {
                     output_tokens_total: e.output_tokens_total,
                     in_flight: in_flight.get(&e.id).map(|v| v.0).unwrap_or(0),
                     in_flight_peak: in_flight.get(&e.id).map(|v| v.1).unwrap_or(0),
+                    req_1m: req_1m_by_id.get(&e.id).copied().unwrap_or(0),
                 })
                 .collect(),
             current_id,
@@ -4152,5 +4207,113 @@ mod tests {
         let e = snap.entries.iter().find(|e| e.id == 1).unwrap();
         assert_eq!(e.in_flight, 1);
         assert_eq!(e.in_flight_peak, 1);
+        assert_eq!(e.req_1m, 1);
+    }
+
+    // ============ 每凭据 RPM 上限测试 ============
+
+    /// 给指定凭据的活动窗口打满 n 条当前时间的请求记录
+    fn fill_rpm(manager: &MultiTokenManager, id: u64, n: u32) {
+        for _ in 0..n {
+            drop(manager.track_request_start(id));
+        }
+    }
+
+    /// 达到 RPM 上限的凭据应被调度跳过，请求落到同优先级的另一条
+    #[test]
+    fn acquire_credential_skips_rpm_capped_credential() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        fill_rpm(&manager, 1, MAX_REQUESTS_PER_MINUTE);
+
+        for _ in 0..3 {
+            let (id, _) = manager.acquire_credential(None).unwrap();
+            assert_eq!(id, 2, "凭据 1 已达 RPM 上限，应始终选中凭据 2");
+        }
+    }
+
+    /// 上限边界是 >=：4 条仍可调度，第 5 条起被排除；全部打满时返回 None
+    #[test]
+    fn acquire_credential_returns_none_when_all_rpm_capped() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        fill_rpm(&manager, 1, MAX_REQUESTS_PER_MINUTE - 1);
+        assert!(manager.acquire_credential(None).is_some(), "未达上限应可调度");
+
+        fill_rpm(&manager, 1, 1);
+        assert!(manager.acquire_credential(None).is_none(), "达到上限应无凭据可用");
+    }
+
+    /// 60s 窗口外的记录不计入 RPM，凭据自动恢复调度
+    #[test]
+    fn rpm_cap_releases_after_window_rolls() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        {
+            let mut activity = manager.activity.lock();
+            let w = activity.entry(1).or_default();
+            for _ in 0..MAX_REQUESTS_PER_MINUTE {
+                w.record_start(Utc::now() - Duration::seconds(61));
+            }
+        }
+
+        let (id, _) = manager.acquire_credential(None).unwrap();
+        assert_eq!(id, 1, "窗口外的旧记录不应挡住调度");
+    }
+
+    /// 粘性凭据达到 RPM 上限时应失效映射、回退 LRU 并重新绑定
+    #[test]
+    fn acquire_credential_sticky_falls_back_when_sticky_rpm_capped() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.convo_sticky.insert("conv".to_string(), 1);
+        fill_rpm(&manager, 1, MAX_REQUESTS_PER_MINUTE);
+
+        let (id, _) = manager.acquire_credential_sticky(None, Some("conv")).unwrap();
+        assert_eq!(id, 2, "粘性凭据打满应回退到凭据 2");
+
+        // 回退后重新绑定：再次调用仍命中凭据 2
+        let (id2, _) = manager.acquire_credential_sticky(None, Some("conv")).unwrap();
+        assert_eq!(id2, 2, "会话应重新绑定到回退凭据");
+    }
+
+    /// 全部凭据 RPM 打满时 acquire_context 快速失败并返回类型化错误；
+    /// RPM 上限不影响 available_count 口径（凭据没"死"，只是暂时忙）
+    #[tokio::test]
+    async fn acquire_context_all_rpm_capped_fails_fast_with_typed_error() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        fill_rpm(&manager, 1, MAX_REQUESTS_PER_MINUTE);
+
+        let err = manager.acquire_context(None, None).await.err().unwrap();
+        assert!(
+            err.downcast_ref::<CredentialsUnavailableError>().is_some(),
+            "应返回 CredentialsUnavailableError，实际: {}",
+            err
+        );
+        assert_eq!(manager.available_count(), 1, "RPM 打满不应计入不可用");
     }
 }
