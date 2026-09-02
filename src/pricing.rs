@@ -37,7 +37,10 @@ pub struct PricingTable {
 const PER_M: f64 = 1e6;
 
 impl PricingTable {
-    /// 内置默认表（Anthropic Claude 4 系列挂牌价，USD/M token）
+    /// 内置默认表（Anthropic 挂牌价，USD/M token，2026-09 同步）
+    ///
+    /// Opus 4.5+/5：$5/$25；Sonnet 4.x：$3/$15；Sonnet 5：$2/$10（永久介绍价）；
+    /// Haiku 4.5：$1/$5。cache_read=0.1×input，cache_creation=1.25×input。
     pub fn builtin() -> Self {
         // Opus 4.5+ 挂牌价（$5/$25 per M）；cache_read=0.1×input，cache_creation=1.25×input
         let opus = ModelPrice {
@@ -58,14 +61,24 @@ impl PricingTable {
             cache_read_input_token_cost: 0.1 / PER_M,
             cache_creation_input_token_cost: 1.25 / PER_M,
         };
+        // Sonnet 5 独立档：$2/$10（上线介绍价，Anthropic 2026-08-10 宣布永久保持，
+        // 原定 2026-09-01 涨至 $3/$15 的计划取消）。cache 倍率同标准（0.1× / 1.25×）。
+        let sonnet_5 = ModelPrice {
+            input_cost_per_token: 2.0 / PER_M,
+            output_cost_per_token: 10.0 / PER_M,
+            cache_read_input_token_cost: 0.2 / PER_M,
+            cache_creation_input_token_cost: 2.5 / PER_M,
+        };
         let mut table = HashMap::new();
         table.insert("claude-opus-4".to_string(), opus);
         table.insert("claude-sonnet-4".to_string(), sonnet);
         table.insert("claude-haiku-4".to_string(), haiku);
-        // Sonnet 5：Sonnet 档挂牌价（$3/$15）。显式插入避免依赖 fallback——
+        // Sonnet 5 / Opus 5 显式插入避免依赖 fallback——
         // "claude-sonnet-5" 不以 "claude-sonnet-4" 为前缀，无显式档会静默落 fallback，
-        // 后续若上游调价或 fallback 改动会导致 Sonnet 5 计费漂移。
-        table.insert("claude-sonnet-5".to_string(), sonnet);
+        // 后续若上游调价或 fallback 改动会导致计费漂移。
+        table.insert("claude-sonnet-5".to_string(), sonnet_5);
+        // Opus 5 同理：不以 "claude-opus-4" 为前缀，无显式档会落 sonnet fallback 低估
+        table.insert("claude-opus-5".to_string(), opus);
         // 未知模型兜底取 sonnet 档（避免低估）
         Self { table, fallback: sonnet }
     }
@@ -192,14 +205,32 @@ mod tests {
     }
 
     #[test]
-    fn test_sonnet_5_resolves_to_sonnet_tier() {
+    fn test_sonnet_5_uses_own_tier() {
         let t = PricingTable::builtin();
-        // claude-sonnet-5 不以 claude-sonnet-4 为前缀,需显式档命中 Sonnet 价($3/$15)
+        // Sonnet 5 独立档 $2/$10(非 Sonnet 4.x 的 $3/$15,Anthropic 2026-08-10 定为永久价)
         let cost = t.cost_usd("claude-sonnet-5", 1_000_000, 0, 0, 1_000_000);
-        assert!((cost - (3.0 + 15.0)).abs() < 1e-6, "got {cost}");
+        assert!((cost - (2.0 + 10.0)).abs() < 1e-6, "got {cost}");
+        // cache 倍率:read 0.1×($0.2/M),creation 1.25×($2.5/M)
+        let cost_cache = t.cost_usd("claude-sonnet-5", 0, 1_000_000, 1_000_000, 0);
+        assert!((cost_cache - (0.2 + 2.5)).abs() < 1e-6, "got {cost_cache}");
         // -thinking 变体归一化后同档
         let cost2 = t.cost_usd("claude-sonnet-5-thinking", 1_000_000, 0, 0, 0);
-        assert!((cost2 - 3.0).abs() < 1e-6, "got {cost2}");
+        assert!((cost2 - 2.0).abs() < 1e-6, "got {cost2}");
+        // Sonnet 4.6 不受影响,仍是 $3/M
+        let cost3 = t.cost_usd("claude-sonnet-4-6", 1_000_000, 0, 0, 0);
+        assert!((cost3 - 3.0).abs() < 1e-6, "got {cost3}");
+    }
+
+    #[test]
+    fn test_opus_5_resolves_to_opus_tier() {
+        let t = PricingTable::builtin();
+        // claude-opus-5 不以 claude-opus-4 为前缀,需显式档命中 Opus 价($5/$25),
+        // 否则静默落 sonnet fallback 低估
+        let cost = t.cost_usd("claude-opus-5", 1_000_000, 0, 0, 1_000_000);
+        assert!((cost - (5.0 + 25.0)).abs() < 1e-6, "got {cost}");
+        // -thinking 变体归一化后同档
+        let cost2 = t.cost_usd("claude-opus-5-thinking", 1_000_000, 0, 0, 0);
+        assert!((cost2 - 5.0).abs() < 1e-6, "got {cost2}");
     }
 
     #[test]

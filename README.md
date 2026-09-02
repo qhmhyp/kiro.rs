@@ -217,6 +217,9 @@ docker-compose up
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `rateLimitCooldownSecs` | number | `8` | 普通 429 累计 5 次触发的凭据冷却时长(秒)。实测上游真实 throttle 窗口 ~10-15s,8s 覆盖大部分场景且与"5 次累计才升级"配合。低于 5s 风险快速 thrashing;高于 30s 收益甚低。风控 429(suspicious activity)不受此影响,固定 600s |
+| `usageCacheEnabled` | boolean | `true` | 是否在返回的 usage 中模拟 prompt cache 命中(不影响真实上游调用)。`false` 时不拆分 cache_read/cache_creation,全部按 `input_tokens` 全价上报,下游计费无缓存折扣 |
+| `usageCacheIdleSecs` | number | `300` | usage 模拟缓存的会话空闲过期秒数。空闲超时后下一轮回到"重建缓存"形态(cache_creation 1.25× 计费)。调小 → 计费更高;`0` = 永不过期。仅 `usageCacheEnabled=true` 时生效 |
+| `usageCacheReadRatio` | number | `1.0` | cache_read 折扣比例(0.0~1.0)。命中部分按该比例上报为 cache_read(0.1× 计费),其余滑回 input_tokens(全价)。`1.0` 全折扣,`0.0` 无折扣。仅 `usageCacheEnabled=true` 时生效 |
 
 完整配置示例：
 
@@ -245,9 +248,40 @@ docker-compose up
 }
 ```
 
+### 可选：usage 上报调参（控制下游计费口径）
+
+返回给客户端的 `usage` 会把输入拆成 `cache_read_input_tokens`（0.1× 计费）/
+`cache_creation_input_tokens`（1.25× 计费）/ `input_tokens`（1× 计费）三段，
+模拟 Anthropic prompt cache。该拆分**不影响真实上游调用**，只决定下游计费工具
+看到的账单。三段之和恒等于真实总输入，账单始终自洽。三个旋钮：
+
+| 目标 | 配置 |
+|------|------|
+| 现状（对齐 Anthropic 语义，下游享全额缓存折扣） | 默认值 |
+| 温和提价：折扣打对折 | `"usageCacheReadRatio": 0.5` |
+| 温和提价：空闲 1 分钟即重建缓存（1.25× 重计一轮） | `"usageCacheIdleSecs": 60` |
+| 无折扣：全部按 input_tokens 全价上报 | `"usageCacheEnabled": false` |
+| 让利：活跃会话永不过期 | `"usageCacheIdleSecs": 0` |
+
+```json
+{
+  "usageCacheEnabled": true,
+  "usageCacheIdleSecs": 300,
+  "usageCacheReadRatio": 1.0
+}
+```
+
+除 config.json 外，也可以在管理页面（顶部导航「usage 上报设置」按钮）在线调整，
+或直接调 Admin API：`GET/PATCH /api/admin/settings/usage-cache`
+（PATCH 体为 `{"enabled":bool,"idleSecs":number,"readRatio":number}`，字段均可选）。
+修改**立即热生效**（无需重启）并自动写回 config.json。
+注意：调整 `idleSecs` 会重置所有会话的命中状态，各会话下一轮按"重建缓存"形态上报一次。
+
+注意：管理员页面的「消耗金额」统计使用同一份拆分，调参后其口径与你向下游收费的口径一致（不再反映 Anthropic 挂牌价下的"真实"成本）。
+
 ### 可选：自定义模型单价（用于「消耗金额」统计）
 
-管理员页面会按「真实 token × 模型单价」累计每个凭据的消耗金额（USD）。单价默认使用内置价格表（Anthropic Claude 4 系列挂牌价；cache 命中按 Anthropic 倍率：cache_read ≈ 0.1× input，cache_creation ≈ 1.25× input）。未知模型按 Sonnet 档兜底。
+管理员页面会按「真实 token × 模型单价」累计每个凭据的消耗金额（USD）。单价默认使用内置价格表（Anthropic 挂牌价，2026-09 同步：Opus 4.5+/5 为 $5/$25、Sonnet 4.x 为 $3/$15、Sonnet 5 为 $2/$10 永久介绍价、Haiku 4.5 为 $1/$5，均为 USD/M token；cache 命中按 Anthropic 倍率：cache_read ≈ 0.1× input，cache_creation ≈ 1.25× input）。未知模型按 Sonnet 4.x 档兜底。
 
 如需覆盖，可在 `config.json` 加 `pricing` 节点（单位：USD / token）：
 
@@ -492,6 +526,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*sonnet-5*` | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（其他） | `claude-sonnet-4.5` |
+| `*opus-5*` | `claude-opus-5` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
 | `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
 | `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
