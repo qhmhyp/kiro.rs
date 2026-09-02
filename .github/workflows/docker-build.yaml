@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - master
+      # 临时:分支构建验证用,合并进 master 前移除
+      - feat/usage-report-tuning
     tags:
       - 'v*'
   workflow_dispatch:
