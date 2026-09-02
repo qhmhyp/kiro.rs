@@ -175,11 +175,19 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // usage 模拟缓存：anthropic 路由与 Admin API 共享同一实例，支持页面热更新
+    let convo_cache = Arc::new(anthropic::ConvoTokenCache::with_options(
+        config.usage_cache_enabled,
+        config.usage_cache_idle_secs,
+        config.usage_cache_read_ratio,
+    ));
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider.clone()),
         config.extract_thinking,
+        convo_cache.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -195,8 +203,13 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), kiro_provider.clone(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                kiro_provider.clone(),
+                endpoint_names.clone(),
+                convo_cache.clone(),
+                Some(std::path::PathBuf::from(&config_path)),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

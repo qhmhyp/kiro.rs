@@ -8,8 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, reset_failure_count, set_credential_disabled,
-        set_credential_priority, update_credential, verify_credential_message,
+        get_credential_balance, get_usage_cache_settings, reset_failure_count,
+        set_credential_disabled, set_credential_priority, update_credential,
+        update_usage_cache_settings, verify_credential_message,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -27,6 +28,8 @@ use super::{
 /// - `GET /credentials/:id/balance` - 获取凭据余额
 /// - `POST /credentials/:id/verify-message` - 用指定模型发一次最小 messages 请求验证凭据
 /// - `PATCH /credentials/:id` - 部分更新凭据字段（refresh_token / proxy / endpoint 等）
+/// - `GET /settings/usage-cache` - 获取 usage 上报设置
+/// - `PATCH /settings/usage-cache` - 更新 usage 上报设置（热生效 + 写回 config.json）
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -50,6 +53,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials/{id}/verify-message",
             post(verify_credential_message),
+        )
+        .route(
+            "/settings/usage-cache",
+            get(get_usage_cache_settings).patch(update_usage_cache_settings),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

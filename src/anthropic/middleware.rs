@@ -32,12 +32,16 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        convo_cache: Arc<ConvoTokenCache>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
-            convo_cache: Arc::new(ConvoTokenCache::new()),
+            convo_cache,
         }
     }
 

@@ -112,6 +112,33 @@ pub struct Config {
     #[serde(default = "default_rate_limit_cooldown_secs")]
     pub rate_limit_cooldown_secs: u64,
 
+    /// 是否在返回的 usage 中模拟 prompt cache 命中（默认 true）
+    ///
+    /// 该模拟不影响真实上游调用，只决定返回给客户端的 usage 拆分：
+    /// - true：历史部分拆为 cache_read（0.1× 计费）/ cache_creation（1.25× 计费）
+    /// - false：不拆分，全部按 input_tokens 全价上报。下游计费不再享受缓存折扣，
+    ///   长对话下计费金额显著提高
+    #[serde(default = "default_usage_cache_enabled")]
+    pub usage_cache_enabled: bool,
+
+    /// usage 模拟缓存的会话空闲过期时间（秒），默认 300（对齐 Anthropic ephemeral cache）
+    ///
+    /// 会话空闲超过该时长后，下一轮回到"重建缓存"形态（历史按 cache_creation 1.25× 计费）。
+    /// 调小 → 缓存更快失效、计费更高；0 = 永不过期（活跃会话持续享受 cache_read 折扣）。
+    /// 仅在 usageCacheEnabled=true 时生效。
+    #[serde(default = "default_usage_cache_idle_secs")]
+    pub usage_cache_idle_secs: u64,
+
+    /// cache_read 折扣比例（0.0 ~ 1.0），默认 1.0
+    ///
+    /// 命中缓存的历史部分中，按该比例上报为 cache_read（0.1× 计费），
+    /// 其余滑回 input_tokens（1× 全价）。这是"全折扣"与"无折扣"之间的连续旋钮：
+    /// 1.0 = 现状（全额折扣）；0.5 = 折扣减半；0.0 = 命中部分全部全价。
+    /// 三段之和恒等于真实总输入，下游账单仍然自洽。超出范围自动夹取。
+    /// 仅在 usageCacheEnabled=true 时生效。
+    #[serde(default = "default_usage_cache_read_ratio")]
+    pub usage_cache_read_ratio: f64,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -175,6 +202,18 @@ fn default_rate_limit_cooldown_secs() -> u64 {
     8
 }
 
+fn default_usage_cache_enabled() -> bool {
+    true
+}
+
+fn default_usage_cache_idle_secs() -> u64 {
+    300
+}
+
+fn default_usage_cache_read_ratio() -> f64 {
+    1.0
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -204,6 +243,9 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
+            usage_cache_enabled: default_usage_cache_enabled(),
+            usage_cache_idle_secs: default_usage_cache_idle_secs(),
+            usage_cache_read_ratio: default_usage_cache_read_ratio(),
             endpoints: HashMap::new(),
             pricing: None,
             config_path: None,

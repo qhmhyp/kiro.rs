@@ -8,6 +8,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::{ConvoTokenCache, UsageCacheSettings};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::provider::{KiroProvider, VerifyOutcome};
 use crate::kiro::token_manager::{CredentialUpdate, MultiTokenManager};
@@ -15,7 +16,8 @@ use crate::kiro::token_manager::{CredentialUpdate, MultiTokenManager};
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, UpdateCredentialRequest,
+    CredentialsStatusResponse, UpdateCredentialRequest, UpdateUsageCacheSettingsRequest,
+    UsageCacheSettingsResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -40,6 +42,10 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// usage 模拟缓存（与 anthropic 路由共享，支持运行时热更新）
+    convo_cache: Arc<ConvoTokenCache>,
+    /// config.json 路径（设置变更写回持久化；None 时仅运行时生效）
+    config_path: Option<PathBuf>,
 }
 
 impl AdminService {
@@ -47,6 +53,8 @@ impl AdminService {
         token_manager: Arc<MultiTokenManager>,
         kiro_provider: Arc<KiroProvider>,
         known_endpoints: impl IntoIterator<Item = String>,
+        convo_cache: Arc<ConvoTokenCache>,
+        config_path: Option<PathBuf>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -60,6 +68,8 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            convo_cache,
+            config_path,
         }
     }
 
@@ -581,5 +591,94 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(format!("序列化失败: {}", e)))?;
 
         Ok(self.kiro_provider.send_once_with_credential(id, &body).await)
+    }
+
+    // ============ usage 上报设置 ============
+
+    /// 获取 usage 模拟缓存当前生效的设置
+    pub fn get_usage_cache_settings(&self) -> UsageCacheSettingsResponse {
+        let s = self.convo_cache.settings();
+        UsageCacheSettingsResponse {
+            enabled: s.enabled,
+            idle_secs: s.idle_secs,
+            read_ratio: s.read_ratio,
+            persist_warning: None,
+        }
+    }
+
+    /// 更新 usage 模拟缓存设置：运行时立即生效 + 写回 config.json
+    ///
+    /// 写回失败不回滚运行时状态（设置仍生效到重启为止），响应中携带警告。
+    pub fn update_usage_cache_settings(
+        &self,
+        req: UpdateUsageCacheSettingsRequest,
+    ) -> Result<UsageCacheSettingsResponse, AdminServiceError> {
+        if let Some(ratio) = req.read_ratio {
+            if !(0.0..=1.0).contains(&ratio) {
+                return Err(AdminServiceError::InvalidRequest(format!(
+                    "readRatio 必须在 0.0 ~ 1.0 之间，收到 {}",
+                    ratio
+                )));
+            }
+        }
+
+        let current = self.convo_cache.settings();
+        let next = UsageCacheSettings {
+            enabled: req.enabled.unwrap_or(current.enabled),
+            idle_secs: req.idle_secs.unwrap_or(current.idle_secs),
+            read_ratio: req.read_ratio.unwrap_or(current.read_ratio),
+        };
+        self.convo_cache.apply_settings(next);
+        tracing::info!(
+            enabled = next.enabled,
+            idle_secs = next.idle_secs,
+            read_ratio = next.read_ratio,
+            "usage 上报设置已更新"
+        );
+
+        let persist_warning = match self.persist_usage_cache_settings(&next) {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::warn!("usage 上报设置写回 config.json 失败: {}", e);
+                Some(format!(
+                    "已在运行时生效，但写回 config.json 失败（重启后恢复旧值）: {}",
+                    e
+                ))
+            }
+        };
+
+        let s = self.convo_cache.settings();
+        Ok(UsageCacheSettingsResponse {
+            enabled: s.enabled,
+            idle_secs: s.idle_secs,
+            read_ratio: s.read_ratio,
+            persist_warning,
+        })
+    }
+
+    /// 把三个设置外科手术式写回 config.json：只改这三个键，
+    /// 其余字段（含本程序不认识的字段）原样保留。
+    fn persist_usage_cache_settings(&self, s: &UsageCacheSettings) -> anyhow::Result<()> {
+        let Some(path) = &self.config_path else {
+            anyhow::bail!("config.json 路径未知");
+        };
+
+        let mut value: serde_json::Value = match std::fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str(&content)?,
+            // 配置文件不存在（全默认启动）：从空对象开始创建
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(e.into()),
+        };
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config.json 顶层不是 JSON 对象"))?;
+        obj.insert("usageCacheEnabled".to_string(), serde_json::json!(s.enabled));
+        obj.insert("usageCacheIdleSecs".to_string(), serde_json::json!(s.idle_secs));
+        obj.insert("usageCacheReadRatio".to_string(), serde_json::json!(s.read_ratio));
+
+        let mut out = serde_json::to_string_pretty(&value)?;
+        out.push('\n');
+        std::fs::write(path, out)?;
+        Ok(())
     }
 }

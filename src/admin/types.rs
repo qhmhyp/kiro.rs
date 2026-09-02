@@ -353,6 +353,32 @@ impl AdminErrorResponse {
     }
 }
 
+// ============ usage 上报设置 ============
+
+/// PATCH /settings/usage-cache 请求（字段均可选，缺省字段保持现值）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateUsageCacheSettingsRequest {
+    /// 是否启用 usage 缓存模拟
+    pub enabled: Option<bool>,
+    /// 会话空闲过期秒数（0 = 永不过期）
+    pub idle_secs: Option<u64>,
+    /// cache_read 折扣比例（0.0 ~ 1.0）
+    pub read_ratio: Option<f64>,
+}
+
+/// usage 上报设置响应（GET 与 PATCH 共用）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCacheSettingsResponse {
+    pub enabled: bool,
+    pub idle_secs: u64,
+    pub read_ratio: f64,
+    /// 写回 config.json 失败时的警告（设置仍已在运行时生效）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_warning: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

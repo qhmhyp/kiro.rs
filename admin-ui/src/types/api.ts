@@ -124,6 +124,22 @@ export interface VerifyMessageResponse {
   error?: string | null
 }
 
+// usage 上报设置（GET / PATCH /settings/usage-cache）
+export interface UsageCacheSettings {
+  enabled: boolean
+  idleSecs: number
+  readRatio: number
+  // 写回 config.json 失败时的警告（设置仍已在运行时生效）
+  persistWarning?: string
+}
+
+// usage 上报设置更新请求（缺省字段保持现值）
+export interface UpdateUsageCacheSettingsRequest {
+  enabled?: boolean
+  idleSecs?: number
+  readRatio?: number
+}
+
 // 凭据部分更新请求（PATCH /credentials/:id）
 // 字段语义：undefined = 不修改；"" = 清空；其他 = 设为新值
 export interface UpdateCredentialRequest {

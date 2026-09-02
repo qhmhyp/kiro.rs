@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetPriorityRequest, SuccessResponse,
-        UpdateCredentialRequest, VerifyMessageRequest,
+        UpdateCredentialRequest, UpdateUsageCacheSettingsRequest, VerifyMessageRequest,
     },
 };
 
@@ -131,6 +131,24 @@ pub async fn update_credential(
 ) -> impl IntoResponse {
     match state.service.update_credential(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/settings/usage-cache
+/// 获取 usage 上报设置（当前运行时生效值）
+pub async fn get_usage_cache_settings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_usage_cache_settings())
+}
+
+/// PATCH /api/admin/settings/usage-cache
+/// 更新 usage 上报设置：运行时立即生效并写回 config.json
+pub async fn update_usage_cache_settings(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateUsageCacheSettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.update_usage_cache_settings(payload) {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
