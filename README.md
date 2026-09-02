@@ -281,9 +281,13 @@ docker-compose up
 
 ### 可选：自定义模型单价（用于「消耗金额」统计）
 
-管理员页面会按「真实 token × 模型单价」累计每个凭据的消耗金额（USD）。单价默认使用内置价格表（Anthropic 挂牌价，2026-09 同步：Opus 4.5+/5 为 $5/$25、Sonnet 4.x 为 $3/$15、Sonnet 5 为 $2/$10 永久介绍价、Haiku 4.5 为 $1/$5，均为 USD/M token；cache 命中按 Anthropic 倍率：cache_read ≈ 0.1× input，cache_creation ≈ 1.25× input）。未知模型按 Sonnet 4.x 档兜底。
+管理员页面会按「真实 token × 模型单价」累计每个凭据的消耗金额（USD）。计费口径与 [sub2api](https://github.com/Wei-Shaw/sub2api) 的默认路径（token 模式、无渠道倍率）一致，价格数据对齐其价格表 model-price-repo（2026-09 同步）：
 
-如需覆盖，可在 `config.json` 加 `pricing` 节点（单位：USD / token）：
+- 单价：Opus 4.5+/5 为 $5/$25、Sonnet 4.x 为 $3/$15、Sonnet 5 为 $2/$10 永久介绍价、Haiku 4.5 为 $1/$5（USD/M token）；cache_read = 0.1× input，cache_creation = 1.25× input。
+- 长上下文阶梯：`claude-sonnet-4` / `claude-sonnet-4-5` 在输入侧三段之和（input + cache_read + cache_creation）**严格大于 200K** 时整单重计价——输入侧三段同乘 2×、输出乘 1.5×（不是只对超出部分加价）。Sonnet 4.6、Sonnet 5、Opus 全系为全窗口平价（Anthropic 2026-03-13 起对 4.6+ 取消长上下文加价）。
+- 未知模型按 Sonnet 4.x 平价档兜底（不带阶梯）。
+
+如需覆盖，可在 `config.json` 加 `pricing` 节点（单位：USD / token；`longContext*` 字段可选，用于配置/关闭长上下文阶梯）：
 
 ```json
 {
@@ -292,13 +296,17 @@ docker-compose up
       "input": 0.000005,
       "output": 0.000025,
       "cacheRead": 0.0000005,
-      "cacheCreation": 0.00000625
+      "cacheCreation": 0.00000625,
+      "longContextThreshold": 200000,
+      "longContextInputMultiplier": 2.0,
+      "longContextOutputMultiplier": 1.5
     }
   }
 }
 ```
 
 - key 为模型 id；可只覆盖部分模型，其余沿用内置价。
+- 覆盖是整条替换：覆盖内置带阶梯的档（如 `claude-sonnet-4-5`）时若不写 `longContext*` 字段，该模型即变为全窗口平价。
 - 金额为永久累计，持久化在 `kiro_stats.json`，按记录时刻的单价计入（改价不回溯历史）。
 
 ### credentials.json
