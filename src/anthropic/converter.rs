@@ -81,6 +81,7 @@ Complete all chunked operations without commentary.";
 /// - sonnet-5 → claude-sonnet-5
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
+/// - opus-5 → claude-opus-5
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - opus 4.7/4-7 → claude-opus-4.7
 /// - opus 4.8/4-8 → claude-opus-4.8
@@ -99,7 +100,11 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        // "opus-5" 不会误匹配 "opus-4-5"（后者是 "4-5" 而非 "-5" 直跟 opus），
+        // 但需置于 4-x 判断之前，避免遗漏
+        if model_lower.contains("opus-5") {
+            Some("claude-opus-5".to_string())
+        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
@@ -119,11 +124,12 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。Opus 4.7/4.8、Sonnet 5 同为 1M。
+/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。Opus 4.7/4.8、Sonnet 5、Opus 5 同为 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
             if mapped == "claude-sonnet-5"
+                || mapped == "claude-opus-5"
                 || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
@@ -1093,6 +1099,39 @@ mod tests {
             map_model("claude-3-5-sonnet-20241022"),
             Some("claude-sonnet-4.5".to_string())
         );
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        // Kiro 上线 claude-opus-5（无小版本号），上游 ID 同名
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_opus_5_no_false_match() {
+        // 回归：opus-4-5 不应误匹配为 opus-5（"opus-5" 需直跟 opus）
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4.5"),
+            Some("claude-opus-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_context_window_opus_5_is_1m() {
+        // Opus 5 与 Sonnet 5 一致为 1M 上下文（上游 hank9999/kiro.rs#195）
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-5-thinking"), 1_000_000);
     }
 
     #[test]
