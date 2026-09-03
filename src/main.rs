@@ -246,5 +246,32 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // 优雅关停：SIGTERM（docker stop / k8s 滚更）或 Ctrl-C 时停止接收新连接、
+    // 等待在途请求完成，随后强制落盘统计（否则 30s 防抖窗口内的记账会丢）
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+    token_manager.flush_stats();
+    tracing::info!("服务已退出");
+}
+
+/// 等待关停信号（SIGTERM 或 Ctrl-C）
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("监听 Ctrl-C 失败");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("监听 SIGTERM 失败")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("收到 Ctrl-C，开始优雅关停"),
+        _ = terminate => tracing::info!("收到 SIGTERM，开始优雅关停"),
+    }
 }

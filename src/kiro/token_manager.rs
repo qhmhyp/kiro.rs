@@ -1531,6 +1531,17 @@ impl MultiTokenManager {
         }
     }
 
+    /// 进程退出前强制落盘统计（绕过 debounce）
+    ///
+    /// 统计落盘是 30s 防抖的，收到关停信号时窗口内的记账会丢；
+    /// 优雅关停路径在服务停止后调用本方法兜底。无未保存变更时不写盘。
+    pub fn flush_stats(&self) {
+        if self.stats_dirty.load(Ordering::Relaxed) {
+            self.save_stats();
+            tracing::info!("关停前统计数据已落盘");
+        }
+    }
+
     /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
     fn save_stats_debounced(&self) {
         self.stats_dirty.store(true, Ordering::Relaxed);
